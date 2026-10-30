@@ -27,13 +27,6 @@ Before you start:
   modules do not load (`./install.sh status` says so). With Secure Boot off nothing is asked;
   `sudo ./install.sh kernel` prints how to enrol the key if you want to turn Secure Boot on later.
 
-Secure Boot details: while Secure Boot is off the kernel does not load MOK keys at all, so the log
-says `module verification failed` for the modules; that is expected and goes away once Secure Boot
-is on. Fedora's kernel accepts the DKMS key via its platform keyring; a kernel without that fallback
-needs the MOK certificate to be a CA certificate (`basicConstraints=CA:TRUE`, `keyUsage=keyCertSign`),
-so regenerate and re-enrol it that way if modules are rejected. Without DKMS the modules are
-unsigned and Secure Boot must stay off.
-
 ## What is fixed
 
 | Area | Problem on a stock kernel | Fix | Where |
@@ -65,7 +58,8 @@ installed in `/lib/modules/<kernel>/updates/` (or `extra/`, where Fedora's DKMS 
 `depmod.d` file makes both take precedence over the distribution's copies). With `dkms` installed
 (recommended, `install.sh deps` installs it on Fedora), `install.sh kernel` registers the tree
 with DKMS so every kernel update rebuilds the modules automatically (network access is needed at
-that time). Without DKMS, run `sudo ./install.sh kernel` after each kernel update. Nothing in the
+that time). Without DKMS, run `sudo ./install.sh kernel` after each kernel update; those modules are
+unsigned, so that path needs Secure Boot off. Nothing in the
 running kernel is modified; `uninstall.sh` returns to the distribution's modules.
 
 Two side effects of out-of-tree modules are handled by `configs/`: dracut (and Fedora's DKMS, which
@@ -127,9 +121,11 @@ environment disables the temporal filter for comparisons.
 - **DKMS did not build for a new kernel** (`dkms status` lacks the kernel): the build at kernel
   installation failed (no network, or kernel.org had no tag yet). `surface-laptop-7-intel-dkms.service`
   retries once the network is up at the next boot; `sudo ./install.sh kernel` builds right away.
-- **Secure Boot** rejects the modules (`module verification failed` plus a load failure): either the
-  MOK key is not enrolled or the kernel does not trust it yet. Check with `sudo keyctl list %:.machine`;
-  keep Secure Boot off until the DKMS key is listed there.
+- **Secure Boot rejects the modules** (`module verification failed` plus a load failure): the MOK key
+  is not enrolled, so redo the enrolment above. `sudo ./install.sh status` shows which kernel keyring
+  holds the key. Fedora's kernel accepts it from the platform keyring; a kernel that only consults
+  the machine keyring needs the MOK certificate to be a CA certificate (`basicConstraints=CA:TRUE`,
+  `keyUsage=keyCertSign`), so regenerate and re-enrol it that way.
 
 ## Diagnostics
 
