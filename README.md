@@ -1,5 +1,7 @@
 # Surface Laptop 7 (Intel) on Linux
 
+Based on nierdal's bring-up work [here](https://github.com/linux-surface/linux-surface/issues/1710#issuecomment-5048324568) and Christian Schaller's work [here](https://blogs.gnome.org/uraeus/2026/10/15/aiandreverseengineerhardware/).
+
 Fixes for the Surface Laptop for Business 7th Edition with Intel (Lunar Lake, ACPI id MSHW0551,
 model 2107) on a stock distribution kernel. Developed and tested on Fedora 44 with kernel 7.2.x;
 the kernel part fetches the sources for whatever kernel you run and should work on any
