@@ -1,0 +1,61 @@
+From 3ed74c8eb16d6df11e936b126234f85393634572 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Wed, 28 Oct 2026 17:23:31 -0400
+Subject: [PATCH 7/8] detector: merge overlapping clusters before padding the
+ boxes
+
+Padding first could make the boxes of two separate fingers intersect; the
+merge decision belongs to the spanned extent. (The close-finger merging seen
+on the SL7 is addressed by peak suppression in the device config.)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/contacts/detection/detector.hpp | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/src/contacts/detection/detector.hpp b/src/contacts/detection/detector.hpp
+index 09e5dda..05926c1 100644
+--- a/src/contacts/detection/detector.hpp
++++ b/src/contacts/detection/detector.hpp
+@@ -158,6 +158,20 @@ public:
+ 			if (cluster.isEmpty())
+ 				continue;
+ 
++			m_clusters.push_back(std::move(cluster));
++		}
++
++		/*
++		 * Merge overlapping clusters on the spanned boxes, before padding:
++		 * two maxima inside one blob span the same cells and must become
++		 * one contact, two fingers separated by a valley span disjoint
++		 * boxes and must stay apart whatever the padding does.
++		 */
++		overlaps::merge(m_clusters, m_clusters_temp, 5);
++
++		for (auto it = m_clusters.begin(); it != m_clusters.end();) {
++			Box &cluster = *it;
++
+ 			// Extend the sides of the cluster by one pixel
+ 			cluster.min() = (cluster.min() - one).cwiseMax(0);
+ 			cluster.max() = (cluster.max() + one).cwiseMin(dimensions);
+@@ -167,14 +181,11 @@ public:
+ 
+ 			// For gaussian fitting, the clusters should have at least 3x3 pixels
+ 			if (size.x() < 3 || size.y() < 3)
+-				continue;
+-
+-			m_clusters.push_back(std::move(cluster));
++				it = m_clusters.erase(it);
++			else
++				++it;
+ 		}
+ 
+-		// Merge overlapping clusters
+-		overlaps::merge(m_clusters, m_clusters_temp, 5);
+-
+ 		// Prepare clusters for gaussian fitting
+ 		for (const Box &cluster : m_clusters) {
+ 			const Vector2<TFit> mean = cluster.cast<TFit>().center();
+-- 
+2.56.0
+

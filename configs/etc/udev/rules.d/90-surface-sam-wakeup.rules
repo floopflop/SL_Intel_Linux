@@ -1,0 +1,5 @@
+# Surface Laptop 7: let the power button (SAM keyboard behind the EC's UART) wake
+# the machine from s2idle. The internal keyboard sits behind surface_serial_hub,
+# whose wakeup is disabled by default; without this only the lid wakes the machine.
+ACTION=="add", SUBSYSTEM=="serial", DRIVER=="surface_serial_hub", ATTR{power/wakeup}="enabled"
+ACTION=="add", SUBSYSTEM=="serial", KERNEL=="serial0", ATTR{power/wakeup}="enabled"

@@ -1,0 +1,13 @@
+# build products and fetched sources
+kernel/src/
+kernel/out/
+iptsd/src/
+iptsd/*.log
+libcamera/src/
+libcamera/stage/
+libcamera/*.log
+captures/
+*.ko
+__pycache__/
+# third-party write-up kept locally only (not ours to relicense)
+docs/nierdal-report.md

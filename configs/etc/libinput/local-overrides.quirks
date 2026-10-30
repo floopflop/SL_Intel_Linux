@@ -1,0 +1,7 @@
+# Surface Laptop 7 haptic touchpad via iptsd: size-based palm rejection.
+# Local measurements: fingertip ABS_MT_TOUCH_MAJOR ~850-1100, palm/thumb ~1550-1650.
+# Any contact above 1400 is treated as a palm (no cursor motion, no taps, no gestures).
+[IPTSD Virtual Touchpad]
+MatchUdevType=touchpad
+MatchName=IPTSD Virtual Touchpad*
+AttrPalmSizeThreshold=1400

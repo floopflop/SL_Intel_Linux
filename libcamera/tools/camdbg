@@ -1,0 +1,60 @@
+#!/bin/bash
+# camdbg - small root helper for the OV02C10 / IPU7 investigation. Run with sudo.
+# Actions are fixed; arguments are validated.
+set -euo pipefail
+KO=${KO:-}   # optional: path to an out-of-tree ov02c10.ko for the reload subcommand
+BUS=3; ADDR=0x36
+usage() { echo "camdbg reload [param=value ...] | unload | i2cget REG | i2cset REG VAL | eeprom [N] | klog [N] | dyndbg on|off | status"; exit 1; }
+hex16() { [[ "$1" =~ ^0x[0-9a-fA-F]{1,4}$ ]] || { echo "bad register $1"; exit 1; }; }
+hex8()  { [[ "$1" =~ ^0x[0-9a-fA-F]{1,2}$ ]] || { echo "bad value $1"; exit 1; }; }
+case "${1:-}" in
+  reload)
+    shift
+    for p in "$@"; do [[ "$p" =~ ^[a-z_]+=[A-Za-z0-9_,:x=-]+$ ]] || { echo "bad param $p"; exit 1; }; done
+    # The sensor is held by the IPU7 image system (v4l2 async notifier): take the
+    # isys down first, swap the sensor module, bring the isys back.
+    modprobe -r intel_ipu7_isys 2>/dev/null || { echo "isys busy (a capture is running?)"; lsmod | grep -E '^intel_ipu7_isys|^ov02c10'; exit 1; }
+    modprobe -r ov02c10 2>/dev/null || true
+    # modprobe -r drops now-unused dependencies (v4l2_cci etc.), so plain insmod fails with
+    # "Unknown symbol": install the experimental build where modprobe finds it instead.
+    if [ -f "$KO" ]; then
+      install -m 644 "$KO" "/lib/modules/$(uname -r)/updates/ov02c10.ko"; depmod -a
+    fi
+    modprobe ov02c10 "$@"
+    modprobe intel_ipu7_isys
+    sleep 2; dmesg | grep -iE 'ov02c10|isys.*bind|Connected' | tail -6
+    echo "params: $(for f in /sys/module/ov02c10/parameters/*; do echo -n "$(basename $f)=$(cat $f) "; done)" ;;
+  unload) modprobe -r ov02c10 ;;
+  i2cget)
+    hex16 "$2"; r=$2
+    i2ctransfer -f -y $BUS w2@$ADDR $((r>>8)) $((r&0xff)) r1@$ADDR ;;
+  i2cset)
+    hex16 "$2"; hex8 "$3"; r=$2
+    i2ctransfer -f -y $BUS w3@$ADDR $((r>>8)) $((r&0xff)) "$3" ;;
+  eeprom)
+    # dump the camera module EEPROM at 0x50 (ACPI _CRS lists it next to the sensor).
+    # Try 16-bit addressing (24C32+) first; falls back to 8-bit (24C02..24C16).
+    n=${2:-256}; [[ "$n" =~ ^[0-9]+$ ]] || exit 1
+    # The module rail is off when the camera idles (runtime PM); hold the sensor on.
+    PC=/sys/bus/i2c/devices/i2c-OVTI02C1:00/power/control
+    echo on > $PC; sleep 0.3
+    trap 'echo auto > '"$PC" EXIT
+    OUT=${OUT:-$(cd "$(dirname "$0")" && pwd)/../eeprom-$(date +%Y%m%d-%H%M%S).txt}
+    { if i2ctransfer -f -y $BUS w2@0x50 0x00 0x00 r1@0x50 >/dev/null 2>&1; then
+        echo "# 16-bit addressing"
+        # read in 2 KB chunks: one i2c message cannot exceed the i2c-dev limit
+        off=0; while [ $off -lt $n ]; do c=$(( n-off < 2048 ? n-off : 2048 )); hi=$(( off>>8 )); lo=$(( off&255 ))
+          i2ctransfer -f -y $BUS w2@0x50 $(printf 0x%02x $hi) $(printf 0x%02x $lo) r$c@0x50; off=$(( off+c )); done
+      else
+        echo "# 8-bit addressing"; i2ctransfer -f -y $BUS w1@0x50 0x00 r$n@0x50
+      fi; } | tee "$OUT"; chown ${SUDO_UID:-1000} "$OUT"; echo "saved $OUT" ;;
+  klog) dmesg | grep -iE 'ov02c10|ipu7|csi2|int3472|OVTI' | tail -"${2:-60}" ;;
+  dyndbg)
+    f='+p'; [ "${2:-on}" = off ] && f='-p'
+    for m in ov02c10 intel_ipu7 intel_ipu7_isys; do echo "module $m $f" > /sys/kernel/debug/dynamic_debug/control 2>/dev/null || true; done ;;
+  status)
+    echo "ov02c10: $(modinfo -n ov02c10) loaded=$(lsmod | grep -c '^ov02c10 ')"
+    cat /sys/bus/i2c/devices/i2c-OVTI02C1:00/power/runtime_status 2>/dev/null
+    ls -la /dev/v4l-subdev4 2>/dev/null ;;
+  *) usage ;;
+esac

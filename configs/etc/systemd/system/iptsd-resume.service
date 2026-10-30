@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart iptsd after resume (quickspi firmware falls back to mouse mode)
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'units=$(systemctl list-units --plain --no-legend "iptsd@*.service" | awk "{print \$1}"); [ -n "$units" ] && systemctl restart $units'
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

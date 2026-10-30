@@ -1,0 +1,108 @@
+From 0fda41f3dba9028ec7c3412893ebfa55eefbe292 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Wed, 28 Oct 2026 11:53:34 -0400
+Subject: [PATCH 6/8] daemon: add [Touchpad] HysteresisMm - advertise evdev
+ fuzz so libinput enables jitter hysteresis on every new device
+
+libinput starts a touchpad with hysteresis disabled and only turns it on after
+detecting a one-finger right-left-right wobble; the state is lost whenever the
+device is recreated (every iptsd restart, i.e. every resume). A nonzero fuzz on
+the position axes makes libinput enable it immediately with fuzz as margin.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/apps/daemon/touch.hpp         | 24 ++++++++++++++++++++----
+ src/apps/daemon/uinput-device.hpp |  4 +++-
+ src/core/generic/config.hpp       |  1 +
+ src/core/linux/config-loader.hpp  |  1 +
+ 4 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/apps/daemon/touch.hpp b/src/apps/daemon/touch.hpp
+index 35159d2..2b4aa5d 100644
+--- a/src/apps/daemon/touch.hpp
++++ b/src/apps/daemon/touch.hpp
+@@ -177,15 +177,31 @@ public:
+ 		const i32 res_y = casts::to<i32>(std::round(MAX_Y / (config.height * 10)));
+ 		const i32 res_d = casts::to<i32>(std::round(DIAGONAL / (diag * 10)));
+ 
++		/*
++		 * libinput keeps its jitter hysteresis (a small positional deadband) switched off
++		 * on a fresh touchpad device until it happens to observe a one-finger wobble, and
++		 * forgets that every time the device is recreated (i.e. every iptsd restart, so
++		 * every resume from suspend). A nonzero fuzz on the position axes makes libinput
++		 * enable the hysteresis from the first event, using the fuzz as its margin.
++		 * libinput's udev callout zeroes the kernel fuzz again, so the kernel does not
++		 * filter the data a second time. 0.25 mm matches libinput's own default margin.
++		 */
++		i32 fuzz_x = 0;
++		i32 fuzz_y = 0;
++		if (info.is_touchpad() && config.touchpad_hysteresis_mm > 0) {
++			fuzz_x = casts::to<i32>(std::round(res_x * config.touchpad_hysteresis_mm));
++			fuzz_y = casts::to<i32>(std::round(res_y * config.touchpad_hysteresis_mm));
++		}
++
+ 		m_uinput->set_absinfo(ABS_MT_SLOT, 0, MAX_CONTACTS, 0);
+ 		m_uinput->set_absinfo(ABS_MT_TRACKING_ID, 0, MAX_CONTACTS, 0);
+-		m_uinput->set_absinfo(ABS_MT_POSITION_X, 0, MAX_X, res_x);
+-		m_uinput->set_absinfo(ABS_MT_POSITION_Y, 0, MAX_Y, res_y);
++		m_uinput->set_absinfo(ABS_MT_POSITION_X, 0, MAX_X, res_x, fuzz_x);
++		m_uinput->set_absinfo(ABS_MT_POSITION_Y, 0, MAX_Y, res_y, fuzz_y);
+ 		m_uinput->set_absinfo(ABS_MT_ORIENTATION, 0, 180, 0);
+ 		m_uinput->set_absinfo(ABS_MT_TOUCH_MAJOR, 0, DIAGONAL, res_d);
+ 		m_uinput->set_absinfo(ABS_MT_TOUCH_MINOR, 0, DIAGONAL, res_d);
+-		m_uinput->set_absinfo(ABS_X, 0, MAX_X, res_x);
+-		m_uinput->set_absinfo(ABS_Y, 0, MAX_Y, res_y);
++		m_uinput->set_absinfo(ABS_X, 0, MAX_X, res_x, fuzz_x);
++		m_uinput->set_absinfo(ABS_Y, 0, MAX_Y, res_y, fuzz_y);
+ 
+ 		m_uinput->create();
+ 	}
+diff --git a/src/apps/daemon/uinput-device.hpp b/src/apps/daemon/uinput-device.hpp
+index 7cfba7a..3ea1f63 100644
+--- a/src/apps/daemon/uinput-device.hpp
++++ b/src/apps/daemon/uinput-device.hpp
+@@ -135,7 +135,8 @@ public:
+ 	 * @param[in] max The maximal value of the axis.
+ 	 * @param[in] res The resolution of the axis, for converting virtual to physical units.
+ 	 */
+-	void set_absinfo(const u16 code, const i32 min, const i32 max, const i32 res) const
++	void set_absinfo(const u16 code, const i32 min, const i32 max, const i32 res,
++			 const i32 fuzz = 0) const
+ 	{
+ 		struct uinput_abs_setup abs {};
+ 
+@@ -143,6 +144,7 @@ public:
+ 		abs.absinfo.minimum = min;
+ 		abs.absinfo.maximum = max;
+ 		abs.absinfo.resolution = res;
++		abs.absinfo.fuzz = fuzz;
+ 
+ 		syscalls::ioctl(m_fd, UI_ABS_SETUP, &abs);
+ 	}
+diff --git a/src/core/generic/config.hpp b/src/core/generic/config.hpp
+index ae69e5a..e8ec702 100644
+--- a/src/core/generic/config.hpp
++++ b/src/core/generic/config.hpp
+@@ -38,6 +38,7 @@ public:
+ 	f64 touchpad_lift_grace_ms = 0;
+ 	f64 touchpad_position_smoothing = 0;
+ 	f64 touchpad_multi_finger_motion_scale = 1.0;
++	f64 touchpad_hysteresis_mm = 0.25;
+ 
+ 	// [Contacts]
+ 	std::string contacts_neutral = "mode";
+diff --git a/src/core/linux/config-loader.hpp b/src/core/linux/config-loader.hpp
+index 0e13a05..5f530d5 100644
+--- a/src/core/linux/config-loader.hpp
++++ b/src/core/linux/config-loader.hpp
+@@ -164,6 +164,7 @@ private:
+ 		this->get(ini, "Touchpad", "LiftGraceMs", m_config.touchpad_lift_grace_ms);
+ 		this->get(ini, "Touchpad", "PositionSmoothing", m_config.touchpad_position_smoothing);
+ 		this->get(ini, "Touchpad", "MultiFingerMotionScale", m_config.touchpad_multi_finger_motion_scale);
++		this->get(ini, "Touchpad", "HysteresisMm", m_config.touchpad_hysteresis_mm);
+ 
+ 		this->get(ini, "Contacts", "Neutral", m_config.contacts_neutral);
+ 		this->get(ini, "Contacts", "NeutralValue", m_config.contacts_neutral_value);
+-- 
+2.56.0
+

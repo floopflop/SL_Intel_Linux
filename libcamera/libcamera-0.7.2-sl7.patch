@@ -1,0 +1,4128 @@
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/include/libcamera/internal/software_isp/debayer_params.h libcamera-work/include/libcamera/internal/software_isp/debayer_params.h
+--- srpm/src/include/libcamera/internal/software_isp/debayer_params.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/include/libcamera/internal/software_isp/debayer_params.h	2026-10-29 08:44:25.145509951 -0400
+@@ -25,6 +25,57 @@
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++
++	/*
++	 * Lens shading correction gains, one coarse grid per Bayer channel,
++	 * bilinearly interpolated over the frame by the debayer backend.
++	 *
++	 * The grid is a fixed size array rather than a container because this
++	 * structure lives in memory shared with the IPA. 17x17 matches the grid
++	 * size the rkisp1 hardware uses for the same purpose, which is ample for
++	 * a correction this smooth.
++	 *
++	 * A width or height of zero disables the correction, which is the
++	 * default so that sensors without shading data are unaffected.
++	 */
++	static constexpr unsigned int kLscGridWidth = 17;
++	static constexpr unsigned int kLscGridHeight = 17;
++
++	struct {
++		unsigned int width = 0;
++		unsigned int height = 0;
++		float r[kLscGridHeight][kLscGridWidth] = {};
++		float gr[kLscGridHeight][kLscGridWidth] = {};
++		float gb[kLscGridHeight][kLscGridWidth] = {};
++		float b[kLscGridHeight][kLscGridWidth] = {};
++	} shading;
++
++	/*
++	 * Spatial denoise applied by the debayer backend after tone mapping, in
++	 * the [0, 1] range of the gamma encoded output. chromaSigma is the
++	 * bilateral range sigma for chroma, lumaSigma the luma noise sigma (also
++	 * used, widened, to stop chroma averaging across luma edges) and
++	 * lumaStrength how much of the filtered luma is blended in. A zero
++	 * chromaSigma leaves chroma untouched.
++	 */
++	struct {
++		float chromaSigma = 0.0;
++		float lumaSigma = 0.0;
++		float lumaStrength = 0.0;
++		/*
++		 * Temporal denoise (GPU backend): temporalStrength and
++		 * temporalChromaStrength are the luma and chroma weights of the
++		 * previous output where the picture is static (both 0 disables
++		 * the pass), temporalSigma the expected per-pixel noise of the
++		 * frame and temporalLow / temporalHigh the motion thresholds in
++		 * multiples of it.
++		 */
++		float temporalStrength = 0.0;
++		float temporalChromaStrength = 0.0;
++		float temporalSigma = 0.0;
++		float temporalLow = 1.5;
++		float temporalHigh = 3.5;
++	} denoise;
+ };
+ 
+ } /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/include/libcamera/internal/software_isp/software_isp.h libcamera-work/include/libcamera/internal/software_isp/software_isp.h
+--- srpm/src/include/libcamera/internal/software_isp/software_isp.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/include/libcamera/internal/software_isp/software_isp.h	2026-10-28 13:29:42.208923348 -0400
+@@ -100,6 +100,8 @@
+ 	DebayerParams debayerParams_;
+ 	DmaBufAllocator dmaHeap_;
+ 	bool ccmEnabled_;
++	bool lscEnabled_;
++	bool denoiseEnabled_;
+ 
+ 	std::unique_ptr<ipa::soft::IPAProxySoft> ipa_;
+ 	std::deque<FrameBuffer *> queuedInputBuffers_;
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/include/libcamera/internal/software_isp/swisp_stats.h libcamera-work/include/libcamera/internal/software_isp/swisp_stats.h
+--- srpm/src/include/libcamera/internal/software_isp/swisp_stats.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/include/libcamera/internal/software_isp/swisp_stats.h	2026-10-28 14:35:18.540201846 -0400
+@@ -43,6 +43,31 @@
+ 	 * \brief A histogram of luminance values of all the sampled pixels
+ 	 */
+ 	Histogram yHistogram;
++
++	/**
++	 * \brief Zoned colour sums split by luminance band
++	 *
++	 * The statistics window is divided into kZoneCols x kZoneRows zones
++	 * and the yHistogram range into kLumaBands bands. zoneSum_[zone][band]
++	 * holds the colour sums of the sampled pixels of that zone falling in
++	 * that band, zoneCount_ the number of pixels. Together they let the
++	 * IPA weight its white balance by luminance (favouring the bright,
++	 * unclipped part of the frame) and by position (accounting for lens
++	 * shading, which the raw frame does not have corrected yet).
++	 */
++	static constexpr unsigned int kZoneCols = 8;
++	static constexpr unsigned int kZoneRows = 8;
++	static constexpr unsigned int kLumaBands = 4;
++	RGB<uint64_t> zoneSum_[kZoneRows * kZoneCols][kLumaBands];
++	uint32_t zoneCount_[kZoneRows * kZoneCols][kLumaBands];
++
++	/**
++	 * \brief The statistics window within the sensor frame, in pixels
++	 */
++	uint32_t windowX, windowY, windowWidth, windowHeight;
++
++	/** \brief Scratch: zone row of the line being processed */
++	uint32_t zoneRow;
+ };
+ 
+ } /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/include/libcamera/internal/software_isp/swstats_cpu.h libcamera-work/include/libcamera/internal/software_isp/swstats_cpu.h
+--- srpm/src/include/libcamera/internal/software_isp/swstats_cpu.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/include/libcamera/internal/software_isp/swstats_cpu.h	2026-10-28 14:35:18.540958880 -0400
+@@ -67,6 +67,7 @@
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
++		stats_[statsBufferIndex].zoneRow = (y - window_.y) * SwIspStats::kZoneRows / window_.height;
+ 		(this->*stats0_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+@@ -79,6 +80,7 @@
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
++		stats_[statsBufferIndex].zoneRow = (y - window_.y) * SwIspStats::kZoneRows / window_.height;
+ 		(this->*stats2_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/include/libcamera/ipa/soft.mojom libcamera-work/include/libcamera/ipa/soft.mojom
+--- srpm/src/include/libcamera/ipa/soft.mojom	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/include/libcamera/ipa/soft.mojom	2026-10-28 13:29:42.208782375 -0400
+@@ -18,7 +18,8 @@
+ 	     libcamera.SharedFD fdParams,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+-		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled,
++		    bool lscEnabled, bool denoiseEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/libipa/camera_sensor_helper.cpp libcamera-work/src/ipa/libipa/camera_sensor_helper.cpp
+--- srpm/src/src/ipa/libipa/camera_sensor_helper.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/libipa/camera_sensor_helper.cpp	2026-10-27 22:27:44.275288312 -0400
+@@ -702,6 +702,22 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov2685", CameraSensorHelperOv2685)
+ 
++class CameraSensorHelperOv02c10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv02c10()
++	{
++		/*
++		 * Analogue gain register 0x3508 is a Q4.4 value: 0x10 is 1x and
++		 * the driver exposes 0x10..0xf8 (1x..15.5x) in steps of 1/16.
++		 * Black level: 64 at 10 bits, from the module's tuning data.
++		 */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)
++
+ class CameraSensorHelperOv2740 : public CameraSensorHelper
+ {
+ public:
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/agc.cpp libcamera-work/src/ipa/simple/algorithms/agc.cpp
+--- srpm/src/src/ipa/simple/algorithms/agc.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/algorithms/agc.cpp	2026-10-29 08:22:18.880270020 -0400
+@@ -9,9 +9,11 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <limits>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/control_ids.h>
+ 
+ #include "control_ids.h"
+ 
+@@ -65,76 +67,424 @@
+ {
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++/*
++ * Analogue gain up to which the frame rate is kept at its nominal value. Above
++ * it, the frame length is extended (down to half the frame rate) before the
++ * remaining gain range is used: a longer exposure costs motion blur, more
++ * gain costs noise, and at this point noise is the worse of the two.
++ */
++static constexpr double kDefaultLongExposureGain = 4.0;
++
++int Agc::init(IPAContext &context, const ValueNode &tuningData)
++{
++	longExposureGain_ =
++		std::max(1.0, tuningData["longExposureGain"].get<double>(kDefaultLongExposureGain));
++
++	/*
++	 * Controller speed: the per-update correction factor is
++	 * 1 + proportionalGain * error, limited to +/- maxStep. The defaults
++	 * are gentle (at most 15 % per update, one update every few frames)
++	 * and take seconds to climb from a dark start; a webcam can afford
++	 * larger steps since the error shrinks the steps near the target.
++	 */
++	proportionalGain_ = std::clamp(tuningData["proportionalGain"].get<double>(kExpProportionalGain), 0.001, 1.0);
++	maxStep_ = std::clamp(tuningData["maxStep"].get<double>(kExpMaxStep), 0.01, 0.9);
++	/* Half-width of the band around the target in which the exposure is left alone. */
++	hysteresis_ = std::clamp(tuningData["hysteresis"].get<double>(kExposureSatisfactory), 0.02, 1.0);
++
++	/*
++	 * Anti-banding: hold the exposure time to a whole number of mains
++	 * flicker periods (8333 us for 60 Hz lighting, 10000 us for 50 Hz)
++	 * and give the remainder to the analogue gain, so every line sees
++	 * the same number of lamp cycles. Applications may override it with
++	 * the AeFlickerMode / AeFlickerPeriod controls.
++	 */
++	flickerPeriodTuning_ = std::max(0.0, tuningData["flickerPeriod"].get<double>(0.0));
++	flickerPeriodUs_ = flickerPeriodTuning_;
++	context.ctrlMap[&controls::AeFlickerMode] =
++		ControlInfo(static_cast<int32_t>(controls::FlickerOff),
++			    static_cast<int32_t>(controls::FlickerManual),
++			    static_cast<int32_t>(flickerPeriodTuning_ > 0.0 ? controls::FlickerManual
++									    : controls::FlickerOff));
++	context.ctrlMap[&controls::AeFlickerPeriod] =
++		ControlInfo(0, 100000, static_cast<int32_t>(std::lround(flickerPeriodTuning_)));
++
++	/*
++	 * Brightness target, as exposure compensation in stops from the
++	 * controller's built-in target (mean sample value in the middle of
++	 * the range, which is bright for a webcam once the gamma curve is
++	 * applied). The ExposureValue control adds to the tuned value.
++	 */
++	evTuning_ = std::clamp(tuningData["exposureValue"].get<double>(0.0), -8.0, 8.0);
++	ev_ = evTuning_;
++	context.ctrlMap[&controls::ExposureValue] = ControlInfo(-8.0f, 8.0f, 0.0f);
++
++	LOG(IPASoftExposure, Debug) << "Long exposure gain threshold " << longExposureGain_
++				    << ", proportional gain " << proportionalGain_ << ", max step " << maxStep_
++				    << ", flicker period " << flickerPeriodTuning_ << " us"
++				    << ", exposure value " << evTuning_ << " EV, hysteresis " << hysteresis_;
++	return 0;
++}
++
++/*
++ * The session configuration is rebuilt by the IPA on every configure(), so
++ * the tuning value is copied in here rather than in init().
++ */
++int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	context.configuration.agc.longExposureGain = longExposureGain_;
++	vblankDefSensor_ = context.configuration.agc.vblankDef;
++	flickerPeriodUs_ = flickerPeriodTuning_;
++	ev_ = evTuning_;
++	applyFlickerPeriod(context);
++	return 0;
++}
++
++void Agc::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		       [[maybe_unused]] IPAFrameContext &frameContext, const ControlList &controls)
++{
++	const auto &ev = controls.get(controls::ExposureValue);
++	if (ev)
++		ev_ = std::clamp(evTuning_ + static_cast<double>(*ev), -8.0, 8.0);
++
++	const auto &mode = controls.get(controls::AeFlickerMode);
++	if (!mode)
++		return;
++
++	if (*mode == controls::FlickerOff)
++		flickerPeriodUs_ = 0.0;
++	else if (*mode == controls::FlickerManual) {
++		const auto &period = controls.get(controls::AeFlickerPeriod);
++		flickerPeriodUs_ = period ? static_cast<double>(*period) : flickerPeriodTuning_;
++	} else
++		flickerPeriodUs_ = flickerPeriodTuning_;
++	applyFlickerPeriod(context);
++}
++
++/* The flicker period in sensor lines, 0 when anti-banding is off. */
++int32_t Agc::flickerPeriodLines(const IPAContext &context) const
++{
++	const double lineUs = context.configuration.agc.lineDuration.get<std::micro>();
++	if (flickerPeriodUs_ <= 0.0 || lineUs <= 0.0)
++		return 0;
++	return std::max<int32_t>(1, std::lround(flickerPeriodUs_ / lineUs));
++}
++
++/*
++ * The longest frame extension, as a fraction of the nominal frame, accepted
++ * to make the longest exposure at the nominal frame rate a whole number of
++ * flicker periods.
++ */
++static constexpr double kFlickerMaxFrameFit = 0.05;
++
++/*
++ * Fit the nominal frame length to the flicker period. With 60 Hz lighting and
++ * a 30 fps sensor mode the longest exposure at the nominal frame rate falls
++ * just short of four periods, and the choice would be between banding and a
++ * third more gain; a frame a few lines longer makes the longest exposure
++ * flicker-free at the lowest gain.
++ */
++void Agc::applyFlickerPeriod(IPAContext &context)
++{
++	auto &cfg = context.configuration.agc;
++	cfg.vblankDef = vblankDefSensor_;
++
++	const int32_t period = flickerPeriodLines(context);
++	if (period <= 0 || cfg.vblankDef <= 0)
++		return;
++
++	const int32_t exposureMax = cfg.frameHeight + cfg.vblankDef - cfg.exposureMargin;
++	const int32_t fitted = (exposureMax + period - 1) / period * period;
++	const int32_t vblank = fitted + cfg.exposureMargin - cfg.frameHeight;
++	const int32_t frameLength = cfg.frameHeight + cfg.vblankDef;
++	if (vblank > cfg.vblankDef && vblank <= cfg.vblankMax &&
++	    vblank - cfg.vblankDef <= kFlickerMaxFrameFit * frameLength)
++		cfg.vblankDef = vblank;
++
++	LOG(IPASoftExposure, Info)
++		<< "Anti-banding: flicker period " << flickerPeriodUs_ << " us = " << period
++		<< " lines, nominal frame " << cfg.frameHeight + cfg.vblankDef
++		<< " lines (sensor default " << frameLength << ")";
++}
++
++/*
++ * The residual banding accepted rather than a gain change to the other
++ * neighbouring multiple, as the distance of the exposure from the nearest
++ * multiple of the period relative to the exposure: for a sinusoidal light
++ * component that is also the ripple relative to the light's modulation.
++ */
++static constexpr double kFlickerTolerance = 0.02;
++
++/*
++ * Anti-banding: move the exposure time to a whole number of flicker periods
++ * and the difference into the analogue gain, keeping their product. Of the
++ * two neighbouring multiples the one that moves the gain the least and stays
++ * within the exposure and gain limits is taken. Below one period, or when
++ * neither neighbour is reachable, the exposure is left alone: in bright
++ * light the banding has to be accepted, in the dark the light is worth more
++ * than the gain the quantisation would cost.
++ */
++static void quantiseExposure(int32_t &exposure, double &again, int32_t period,
++			     int32_t exposureMin, int32_t exposureMax,
++			     double againMin, double againMax)
++{
++	const double total = static_cast<double>(exposure) * again;
++	const int32_t lower = exposure / period * period;
++	const int32_t upper = lower + period;
++
++	/* The gain change a candidate costs, infinite when out of range. */
++	auto cost = [&](int32_t candidate) {
++		constexpr double inf = std::numeric_limits<double>::infinity();
++		if (candidate < std::max(period, exposureMin) || candidate > exposureMax)
++			return inf;
++		const double gain = total / candidate;
++		if (gain < againMin * (1.0 - 1e-9) || gain > againMax * (1.0 + 1e-9))
++			return inf;
++		return std::abs(std::log(gain / again));
++	};
++
++	const double costLower = cost(lower);
++	const double costUpper = cost(upper);
++	if (!std::isfinite(costLower) && !std::isfinite(costUpper))
++		return;
++	const int32_t chosen = costLower <= costUpper ? lower : upper;
++
++	/*
++	 * Close to a multiple that is out of reach (typically the longest
++	 * exposure of the frame, just short of the next period) the residual
++	 * banding is small and the other multiple costs a sizeable gain
++	 * change: leave the exposure alone.
++	 */
++	const int32_t nearest = (exposure - lower) * 2 < period ? lower : upper;
++	if (chosen != nearest && std::abs(exposure - nearest) <= kFlickerTolerance * exposure)
++		return;
++
++	exposure = chosen;
++	again = std::clamp(total / chosen, againMin, againMax);
++}
++
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV,
++			 double brightnessRatio)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
++	int32_t &vblank = frameContext.sensor.vblank;
++	const auto &cfg = context.configuration.agc;
++	const bool frameLengthControl = cfg.vblankDef > 0;
++
++	/*
++	 * The exposure limit follows the frame length. The sensor driver
++	 * re-ranges the exposure control when blanking changes, which only
++	 * takes effect once the new blanking has been applied, so never ask
++	 * for more exposure than the frame length of this request allows.
++	 */
++	auto exposureMaxFor = [&](int32_t vb) {
++		if (!frameLengthControl)
++			return cfg.exposureMax;
++		return std::max(cfg.exposureMin, cfg.frameHeight + vb - cfg.exposureMargin);
++	};
++	int32_t exposureMax = exposureMaxFor(vblank);
+ 
+ 	double error = kExposureOptimal - exposureMSV;
+ 
+-	if (std::abs(error) <= kExposureSatisfactory)
++	const int32_t periodLines = flickerPeriodLines(context);
++
++	/*
++	 * Anti-banding re-splits the total exposure between exposure time and
++	 * gain on the way out (see store()). Start from the split the control
++	 * law converges to anyway, the longest exposure time and the least
++	 * gain for the same total, so that its branches keep their meaning
++	 * and the quantisation does not accumulate from frame to frame.
++	 */
++	if (periodLines > 0) {
++		const double total = static_cast<double>(exposure) * again;
++		exposure = std::clamp<int32_t>(std::lround(total / cfg.againMin),
++					       cfg.exposureMin, exposureMax);
++		again = std::clamp(total / exposure, cfg.againMin, cfg.againMax);
++	}
++
++	auto store = [&]() {
++		exposure = std::clamp(exposure, cfg.exposureMin, exposureMax);
++		again = std::clamp(again, cfg.againMin, cfg.againMax);
++		if (periodLines > 0)
++			quantiseExposure(exposure, again, periodLines, cfg.exposureMin,
++					 exposureMax, cfg.againMin, cfg.againMax);
++		if (frameLengthControl)
++			vblank = std::clamp(vblank, std::max(cfg.vblankMin, cfg.vblankDef),
++					    cfg.vblankMax);
++		context.activeState.agc.exposure = exposure;
++		context.activeState.agc.again = again;
++		context.activeState.agc.vblank = vblank;
++	};
++
++	/*
++	 * Below the nominal frame length (the sensor's own default when the
++	 * nominal frame has been fitted to the flicker period): lengthen it.
++	 * The exposure range follows once the new blanking is in effect.
++	 */
++	if (frameLengthControl && vblank < cfg.vblankDef) {
++		vblank = cfg.vblankDef;
++		store();
++	}
++
++	if (std::abs(error) <= hysteresis_) {
++		/*
++		 * Correctly exposed, but possibly with a poor split between
++		 * gain and exposure time. Rebalance at constant brightness:
++		 * with more than the long-exposure gain in use, lengthen the
++		 * frame and move the gain into exposure time; with a long frame
++		 * and gain comfortably below that threshold, restore the frame
++		 * rate and take the difference back as gain.
++		 */
++		const double gainLimit = std::min(cfg.longExposureGain, cfg.againMax);
++		constexpr double kRebalanceStep = 1.08;
++
++		if (!frameLengthControl) {
++			/* Nothing to rebalance. */
++		} else if (again > gainLimit * 1.02) {
++			if (exposure < exposureMax) {
++				/* The longer frame is active: use it. */
++				int32_t next = std::min<int32_t>(exposure * kRebalanceStep, exposureMax);
++				next = std::max(next, exposure + 1);
++				again = std::max(gainLimit, again * exposure / next);
++				exposure = next;
++			} else if (vblank < cfg.vblankMax) {
++				int32_t frameLength = cfg.frameHeight + vblank;
++				int32_t next = std::max<int32_t>(frameLength * kRebalanceStep, frameLength + 1);
++				vblank = std::min(next - cfg.frameHeight, cfg.vblankMax);
++			}
++		} else if (vblank > cfg.vblankDef && again * kRebalanceStep < gainLimit) {
++			int32_t frameLength = cfg.frameHeight + vblank;
++			int32_t next = std::min<int32_t>(frameLength / kRebalanceStep, frameLength - 1);
++			vblank = std::max(next - cfg.frameHeight, cfg.vblankDef);
++			exposureMax = exposureMaxFor(vblank);
++			if (exposure > exposureMax) {
++				again = std::min(gainLimit, again * exposure / exposureMax);
++				exposure = exposureMax;
++			}
++		}
++
++		/*
++		 * Stored even when nothing moved: the values may need the
++		 * anti-banding split, and the active state follows the sensor.
++		 */
++		store();
++		LOG(IPASoftExposure, Debug)
++			<< "exposureMSV " << exposureMSV << " error " << error
++			<< " satisfied, exp " << exposure << " again " << again
++			<< " vblank " << vblank;
+ 		return;
++	}
+ 
+ 	/*
+ 	 * Compute a proportional correction factor. The sign of the error
+ 	 * determines the direction: positive error means too dark (increase),
+ 	 * negative means too bright (decrease).
+ 	 */
+-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
+-				-kExpMaxStep, kExpMaxStep);
++	float step = std::clamp(static_cast<float>(error * proportionalGain_),
++				static_cast<float>(-maxStep_), static_cast<float>(maxStep_));
+ 	float factor = 1.0f + step;
+ 
++	/*
++	 * Far from the target the mean sample value saturates and the
++	 * proportional step crawls (a black frame takes minutes to climb).
++	 * There, scale by the measured brightness ratio instead, damped to
++	 * avoid overshooting across the control delay, and let the
++	 * proportional law finish the job near the target.
++	 */
++	constexpr double kFarError = 1.0;
++	if (std::abs(error) > kFarError && brightnessRatio > 0.0) {
++		const double ratioStep = std::clamp(std::pow(brightnessRatio, 0.7), 0.25, 4.0);
++		if ((error > 0 && ratioStep > factor) || (error < 0 && ratioStep < factor))
++			factor = static_cast<float>(ratioStep);
++	}
++
++	auto gainUp = [&]() {
++		double next = again * factor;
++		if (next - again < cfg.againMinStep)
++			again += cfg.againMinStep;
++		else
++			again = next;
++	};
++	auto gainDown = [&]() {
++		double next = again * factor;
++		if (again - next < cfg.againMinStep)
++			again -= cfg.againMinStep;
++		else
++			again = next;
++	};
++
+ 	if (factor > 1.0f) {
+-		/* Scene too dark: increase exposure first, then gain. */
+-		if (exposure < context.configuration.agc.exposureMax) {
++		/*
++		 * Scene too dark: exposure first, then gain up to the long
++		 * exposure threshold, then frame length, then the rest of the
++		 * gain range.
++		 */
++		if (exposure < exposureMax) {
+ 			int32_t next = static_cast<int32_t>(exposure * factor);
+ 			exposure = std::max(next, exposure + 1);
++		} else if (again < std::min(cfg.longExposureGain, cfg.againMax)) {
++			gainUp();
++		} else if (frameLengthControl && vblank < cfg.vblankMax) {
++			int32_t frameLength = cfg.frameHeight + vblank;
++			int32_t next = static_cast<int32_t>(frameLength * factor);
++			next = std::max(next, frameLength + 1);
++			vblank = std::min(next - cfg.frameHeight, cfg.vblankMax);
++			/* exposure follows next frame, once the range is active */
+ 		} else {
+-			double next = again * factor;
+-			if (next - again < context.configuration.agc.againMinStep)
+-				again += context.configuration.agc.againMinStep;
+-			else
+-				again = next;
++			gainUp();
+ 		}
+ 	} else {
+-		/* Scene too bright: decrease gain first, then exposure. */
+-		if (again > context.configuration.agc.again10) {
+-			double next = again * factor;
+-			if (again - next < context.configuration.agc.againMinStep)
+-				again -= context.configuration.agc.againMinStep;
+-			else
+-				again = next;
++		/*
++		 * Scene too bright: the mirror image. Shed the extra gain
++		 * first, then restore the frame rate, then gain, then exposure.
++		 */
++		if (again > std::min(cfg.longExposureGain, cfg.againMax) &&
++		    (!frameLengthControl || vblank > cfg.vblankDef)) {
++			gainDown();
++		} else if (frameLengthControl && vblank > cfg.vblankDef) {
++			int32_t frameLength = cfg.frameHeight + vblank;
++			int32_t next = static_cast<int32_t>(frameLength * factor);
++			next = std::min(next, frameLength - 1);
++			vblank = std::max(next - cfg.frameHeight, cfg.vblankDef);
++			exposureMax = exposureMaxFor(vblank);
++		} else if (again > cfg.again10) {
++			gainDown();
+ 		} else {
+ 			int32_t next = static_cast<int32_t>(exposure * factor);
+ 			exposure = std::min(next, exposure - 1);
+ 		}
+ 	}
+ 
+-	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+-			      context.configuration.agc.exposureMax);
+-	again = std::clamp(again, context.configuration.agc.againMin,
+-			   context.configuration.agc.againMax);
+-
+-	context.activeState.agc.exposure = exposure;
+-	context.activeState.agc.again = again;
++	store();
+ 
+ 	LOG(IPASoftExposure, Debug)
+ 		<< "exposureMSV " << exposureMSV
+ 		<< " error " << error << " factor " << factor
+-		<< " exp " << exposure << " again " << again;
++		<< " exp " << exposure << " again " << again
++		<< " vblank " << vblank;
+ }
+ 
+-void Agc::process(IPAContext &context,
+-		  [[maybe_unused]] const uint32_t frame,
++void Agc::process(IPAContext &context, const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+ 		  const SwIspStats *stats,
+ 		  ControlList &metadata)
+ {
++	LOG(IPASoftExposure, Debug)
++		<< "frame " << frame << " measured exp " << frameContext.sensor.exposure
++		<< " again " << frameContext.sensor.gain << " vblank " << frameContext.sensor.vblank;
+ 	utils::Duration exposureTime =
+ 		context.configuration.agc.lineDuration * frameContext.sensor.exposure;
+ 	metadata.set(controls::ExposureTime, exposureTime.get<std::micro>());
+ 	metadata.set(controls::AnalogueGain, frameContext.sensor.gain);
+ 
++	if (context.configuration.agc.vblankDef) {
++		utils::Duration frameDuration =
++			context.configuration.agc.lineDuration *
++			(context.configuration.agc.frameHeight + frameContext.sensor.vblank);
++		metadata.set(controls::FrameDuration, frameDuration.get<std::micro>());
++	}
++
+ 	if (!context.activeState.agc.valid) {
+ 		/*
+ 		 * Init active-state from sensor values in case updateExposure()
+@@ -142,6 +492,7 @@
+ 		 */
+ 		context.activeState.agc.exposure = frameContext.sensor.exposure;
+ 		context.activeState.agc.again = frameContext.sensor.gain;
++		context.activeState.agc.vblank = frameContext.sensor.vblank;
+ 		context.activeState.agc.valid = true;
+ 	}
+ 
+@@ -152,6 +503,7 @@
+ 		 */
+ 		frameContext.sensor.exposure = context.activeState.agc.exposure;
+ 		frameContext.sensor.gain = context.activeState.agc.again;
++		frameContext.sensor.vblank = context.activeState.agc.vblank;
+ 		return;
+ 	}
+ 
+@@ -177,10 +529,32 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * The histogram is measured before lens shading correction. Map each
++	 * level to where the correction's mean gain will put it, so that the
++	 * exposure is judged on the brightness of the output image.
++	 */
++	const float lscGain = context.activeState.lsc.meanGain > 0.0f
++				      ? context.activeState.lsc.meanGain
++				      : 1.0f;
++	/*
++	 * Exposure compensation: a target of EV stops is met by judging the
++	 * levels as if the image were 2^-EV times as bright.
++	 */
++	const float levelScale = lscGain * static_cast<float>(std::exp2(-ev_));
++
++	double levelSum = 0.0, levelCount = 0.0;
+ 	for (unsigned int i = 0; i < histogramSize; i++) {
+-		unsigned int idx = (i - (i / yHistValsPerBinMod)) / yHistValsPerBin;
++		unsigned int level = std::min<unsigned int>(
++			static_cast<unsigned int>(i * levelScale), histogramSize - 1);
++		unsigned int idx = (level - (level / yHistValsPerBinMod)) / yHistValsPerBin;
+ 		exposureBins[idx] += histogram[blackLevelHistIdx + i];
++		levelSum += static_cast<double>(histogram[blackLevelHistIdx + i]) * (level + 0.5);
++		levelCount += histogram[blackLevelHistIdx + i];
+ 	}
++	/* Target: the middle of the level range, where the MSV optimum sits. */
++	const double meanLevel = levelCount > 0 ? levelSum / levelCount : 0.0;
++	const double brightnessRatio = meanLevel > 0.0 ? (histogramSize / 2.0) / meanLevel : 0.0;
+ 
+ 	for (unsigned int i = 0; i < kExposureBinsCount; i++) {
+ 		LOG(IPASoftExposure, Debug) << i << ": " << exposureBins[i];
+@@ -189,7 +563,7 @@
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++	updateExposure(context, frameContext, exposureMSV, brightnessRatio);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/agc.h libcamera-work/src/ipa/simple/algorithms/agc.h
+--- srpm/src/src/ipa/simple/algorithms/agc.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/algorithms/agc.h	2026-10-29 08:22:18.858320970 -0400
+@@ -19,13 +19,36 @@
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
++
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV,
++			    double brightnessRatio);
++
++	double longExposureGain_ = 4.0;
++	double proportionalGain_ = 0.04;
++	double maxStep_ = 0.15;
++	double hysteresis_ = 0.2;
++	int32_t flickerPeriodLines(const IPAContext &context) const;
++	void applyFlickerPeriod(IPAContext &context);
++
++	/* Mains flicker period to hold the exposure to, in microseconds; 0 = off. */
++	double flickerPeriodUs_ = 0.0;
++	double flickerPeriodTuning_ = 0.0;
++	/* The sensor's nominal blanking, before any flicker fitting. */
++	int32_t vblankDefSensor_ = 0;
++	/* Brightness target as exposure compensation in stops: tuning default plus the ExposureValue control. */
++	double evTuning_ = 0.0;
++	double ev_ = 0.0;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/awb.cpp libcamera-work/src/ipa/simple/algorithms/awb.cpp
+--- srpm/src/src/ipa/simple/algorithms/awb.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/algorithms/awb.cpp	2026-10-28 14:36:01.354295037 -0400
+@@ -7,6 +7,8 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -23,6 +25,17 @@
+ 
+ namespace ipa::soft::algorithms {
+ 
++int Awb::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	lumaWeight_ = std::max(0.0, tuningData["lumaWeight"].get<double>(0.0));
++	clipBins_ = std::min<unsigned int>(tuningData["clipBins"].get<uint32_t>(8),
++					    SwIspStats::kYHistogramSize / 2);
++
++	LOG(IPASoftAwb, Debug) << "Luma weight exponent " << lumaWeight_
++			       << ", clipped bins " << clipBins_;
++	return 0;
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+@@ -71,7 +84,81 @@
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++
++	/*
++	 * Zoned estimate. Every zone's colour sums are weighted by the lens
++	 * shading gain the ISP will apply at that position (the statistics
++	 * are gathered from the uncorrected raw frame) and, per luminance
++	 * band, by (band luminance)^lumaWeight, leaving out the top bands
++	 * where channels clip. Falls back to the plain sums above if too few
++	 * pixels are left.
++	 */
++	const auto &lsc = context.activeState.lsc;
++	if (lumaWeight_ > 0.0 || lsc.valid) {
++		constexpr unsigned int kCols = SwIspStats::kZoneCols;
++		constexpr unsigned int kRows = SwIspStats::kZoneRows;
++		constexpr unsigned int kBands = SwIspStats::kLumaBands;
++		const unsigned int clipBands =
++			std::min(kBands - 1, clipBins_ * kBands / SwIspStats::kYHistogramSize);
++		const unsigned int lastBand = kBands - clipBands;
++		const double frameW = std::max(1u, context.sensorInfo.outputSize.width);
++		const double frameH = std::max(1u, context.sensorInfo.outputSize.height);
++
++		/* Bilinear sample of a 17x17 grid spanning the sensor frame. */
++		auto sample = [](const float grid[17][17], double u, double v) {
++			u = std::clamp(u * 16.0, 0.0, 16.0);
++			v = std::clamp(v * 16.0, 0.0, 16.0);
++			const unsigned int x0 = std::min(15u, static_cast<unsigned int>(u));
++			const unsigned int y0 = std::min(15u, static_cast<unsigned int>(v));
++			const double fx = u - x0, fy = v - y0;
++			return (grid[y0][x0] * (1 - fx) + grid[y0][x0 + 1] * fx) * (1 - fy) +
++			       (grid[y0 + 1][x0] * (1 - fx) + grid[y0 + 1][x0 + 1] * fx) * fy;
++		};
++
++		double accR = 0.0, accG = 0.0, accB = 0.0;
++		uint64_t used = 0;
++
++		for (unsigned int zy = 0; zy < kRows; zy++) {
++			for (unsigned int zx = 0; zx < kCols; zx++) {
++				const unsigned int z = zy * kCols + zx;
++				double gR = 1.0, gG = 1.0, gB = 1.0;
++
++				if (lsc.valid) {
++					const double u = (stats->windowX + (zx + 0.5) * stats->windowWidth / kCols) / frameW;
++					const double v = (stats->windowY + (zy + 0.5) * stats->windowHeight / kRows) / frameH;
++					gR = sample(lsc.r, u, v);
++					gG = (sample(lsc.gr, u, v) + sample(lsc.gb, u, v)) / 2.0;
++					gB = sample(lsc.b, u, v);
++				}
++
++				for (unsigned int band = 0; band < lastBand; band++) {
++					const uint64_t count = stats->zoneCount_[z][band];
++					if (!count)
++						continue;
++
++					const double w = std::pow(band + 0.5, lumaWeight_);
++					const uint64_t bandOffset = blackLevel * count;
++					const RGB<uint64_t> bandSum =
++						stats->zoneSum_[z][band].max(bandOffset) - bandOffset;
++
++					accR += static_cast<double>(bandSum.r()) * gR * w;
++					accG += static_cast<double>(bandSum.g()) * gG * w;
++					accB += static_cast<double>(bandSum.b()) * gB * w;
++					used += count;
++				}
++			}
++		}
++
++		if (used * 50 >= nPixels && accG > 0.0) {
++			/* Keep the integer path below; scale to a comparable range. */
++			const double scale = static_cast<double>(sum.g()) / accG;
++			sum = RGB<uint64_t>({ static_cast<uint64_t>(accR * scale),
++					      static_cast<uint64_t>(accG * scale),
++					      static_cast<uint64_t>(accB * scale) })
++				      .max(minValid);
++		}
++	}
+ 
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/awb.h libcamera-work/src/ipa/simple/algorithms/awb.h
+--- srpm/src/src/ipa/simple/algorithms/awb.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/algorithms/awb.h	2026-10-28 14:14:49.177837170 -0400
+@@ -19,6 +19,7 @@
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+@@ -29,6 +30,17 @@
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	/*
++	 * Exponent of the luminance weighting applied to the colour sums.
++	 * 0 is the plain grey world assumption over every sampled pixel;
++	 * larger values let the bright, unclipped part of the frame (walls,
++	 * ceilings, paper) decide the balance, which suits scenes with large
++	 * coloured objects such as a face filling a webcam frame.
++	 */
++	double lumaWeight_ = 0.0;
++	unsigned int clipBins_ = 8;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/denoise.cpp libcamera-work/src/ipa/simple/algorithms/denoise.cpp
+--- srpm/src/src/ipa/simple/algorithms/denoise.cpp	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/ipa/simple/algorithms/denoise.cpp	2026-10-29 08:44:25.169497195 -0400
+@@ -0,0 +1,155 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP spatial denoise strength
++ *
++ * The filtering itself runs in the debayer backend; this algorithm only picks
++ * the filter sigmas for each frame from the analogue gain the frame was
++ * captured with, as sensor noise grows roughly with the gain.
++ */
++
++#include "denoise.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftDenoise)
++
++int Denoise::parseCurve(const ValueNode &node, Curve &curve)
++{
++	curve.clear();
++
++	if (!node.isList())
++		return 0;
++
++	for (const auto &point : node.asList()) {
++		const auto gain = point["gain"].get<double>();
++		const auto sigma = point["sigma"].get<double>();
++
++		if (!gain || !sigma || *gain <= 0.0 || *sigma < 0.0) {
++			LOG(IPASoftDenoise, Error) << "Invalid denoise curve point";
++			return -EINVAL;
++		}
++
++		curve.emplace_back(*gain, *sigma);
++	}
++
++	std::sort(curve.begin(), curve.end());
++	return 0;
++}
++
++/* Piecewise linear in log(gain), clamped at both ends. */
++double Denoise::interpolate(const Curve &curve, double gain)
++{
++	if (curve.empty())
++		return 0.0;
++	if (gain <= curve.front().first)
++		return curve.front().second;
++	if (gain >= curve.back().first)
++		return curve.back().second;
++
++	for (size_t i = 1; i < curve.size(); i++) {
++		const auto &[g0, s0] = curve[i - 1];
++		const auto &[g1, s1] = curve[i];
++		if (gain > g1)
++			continue;
++
++		const double t = (std::log(gain) - std::log(g0)) /
++				 (std::log(g1) - std::log(g0));
++		return s0 + (s1 - s0) * t;
++	}
++
++	return curve.back().second;
++}
++
++int Denoise::init(IPAContext &context, const ValueNode &tuningData)
++{
++	int ret = parseCurve(tuningData["chroma"], chroma_);
++	if (ret)
++		return ret;
++
++	ret = parseCurve(tuningData["luma"], luma_);
++	if (ret)
++		return ret;
++
++	lumaStrength_ = std::clamp(tuningData["lumaStrength"].get<double>(0.0), 0.0, 1.0);
++
++	/*
++	 * Temporal (recursive) filter in the GPU backend: `temporal` is the
++	 * per-pixel noise sigma by gain that scales the motion thresholds,
++	 * temporalStrength / temporalChromaStrength the luma and chroma
++	 * weights of the previous frame where nothing moved (chroma defaults
++	 * to the luma value; both 0 = off), temporalMotionLow /
++	 * temporalMotionHigh the thresholds in sigmas.
++	 */
++	ret = parseCurve(tuningData["temporal"], temporal_);
++	if (ret)
++		return ret;
++	temporalStrength_ = std::clamp(tuningData["temporalStrength"].get<double>(0.0), 0.0, 0.95);
++	temporalChromaStrength_ = std::clamp(tuningData["temporalChromaStrength"].get<double>(temporalStrength_),
++					     0.0, 0.95);
++	temporalLow_ = std::clamp(tuningData["temporalMotionLow"].get<double>(1.5), 0.0, 20.0);
++	temporalHigh_ = std::clamp(tuningData["temporalMotionHigh"].get<double>(3.5),
++				   static_cast<double>(temporalLow_) + 0.1, 40.0);
++	if (temporal_.empty())
++		temporalStrength_ = temporalChromaStrength_ = 0.0f;
++
++	if (chroma_.empty() && luma_.empty() && temporalStrength_ <= 0.0f &&
++	    temporalChromaStrength_ <= 0.0f) {
++		LOG(IPASoftDenoise, Warning) << "No denoise curves, algorithm disabled";
++		return 0;
++	}
++
++	context.denoiseEnabled = true;
++
++	LOG(IPASoftDenoise, Debug) << "Loaded " << chroma_.size() << " chroma and "
++				   << luma_.size() << " luma curve points, temporal strength "
++				   << temporalStrength_ << " (" << temporal_.size() << " points)";
++	return 0;
++}
++
++/*
++ * The frame context carries no sensor values yet when the ISP parameters are
++ * computed (they arrive with the statistics, after the frame was processed),
++ * so the gain of the most recent frame that had statistics is kept in the
++ * active state by process() and used here: one frame old, but what the
++ * sensor actually applied.
++ */
++void Denoise::process(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		      IPAFrameContext &frameContext,
++		      [[maybe_unused]] const SwIspStats *stats,
++		      [[maybe_unused]] ControlList &metadata)
++{
++	if (frameContext.sensor.gain > 0.0)
++		context.activeState.denoise.gain = frameContext.sensor.gain;
++}
++
++void Denoise::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext, DebayerParams *params)
++{
++	double gain = context.activeState.denoise.gain;
++	if (gain <= 0.0)
++		gain = context.activeState.agc.valid ? context.activeState.agc.again : 1.0;
++
++	params->denoise.chromaSigma = static_cast<float>(interpolate(chroma_, gain) / 255.0);
++	params->denoise.lumaSigma = static_cast<float>(interpolate(luma_, gain) / 255.0);
++	params->denoise.lumaStrength = luma_.empty() ? 0.0f : lumaStrength_;
++	params->denoise.temporalStrength = temporalStrength_;
++	params->denoise.temporalChromaStrength = temporalChromaStrength_;
++	params->denoise.temporalSigma = static_cast<float>(interpolate(temporal_, gain) / 255.0);
++	params->denoise.temporalLow = temporalLow_;
++	params->denoise.temporalHigh = temporalHigh_;
++}
++
++REGISTER_IPA_ALGORITHM(Denoise, "Denoise")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/denoise.h libcamera-work/src/ipa/simple/algorithms/denoise.h
+--- srpm/src/src/ipa/simple/algorithms/denoise.h	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/ipa/simple/algorithms/denoise.h	2026-10-29 08:44:25.168023129 -0400
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP spatial denoise strength
++ */
++
++#pragma once
++
++#include <utility>
++#include <vector>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Denoise : public Algorithm
++{
++public:
++	Denoise() = default;
++	~Denoise() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++	void process(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     const SwIspStats *stats,
++		     ControlList &metadata) override;
++
++private:
++	/* (analogue gain, sigma in 8 bit output code values), sorted by gain. */
++	using Curve = std::vector<std::pair<double, double>>;
++
++	static int parseCurve(const ValueNode &node, Curve &curve);
++	static double interpolate(const Curve &curve, double gain);
++
++	Curve chroma_;
++	Curve luma_;
++	float lumaStrength_ = 0.0f;
++	/* Temporal filter: noise curve for the motion thresholds, history weight, thresholds in sigmas. */
++	Curve temporal_;
++	float temporalStrength_ = 0.0f;
++	float temporalChromaStrength_ = 0.0f;
++	float temporalLow_ = 1.5f;
++	float temporalHigh_ = 3.5f;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/lsc.cpp libcamera-work/src/ipa/simple/algorithms/lsc.cpp
+--- srpm/src/src/ipa/simple/algorithms/lsc.cpp	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/ipa/simple/algorithms/lsc.cpp	2026-10-28 16:37:07.264385758 -0400
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP lens shading correction
++ *
++ * Self contained rather than built on libipa's shared LscAlgorithm, which does
++ * not exist in this release. It parses radial polynomials directly and samples
++ * them over the sensor's analogue crop.
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++namespace {
++
++const char *kComponents[] = { "r", "gr", "gb", "b" };
++
++std::optional<ipa::LscPolynomial> parsePolynomial(const ValueNode &node)
++{
++	const auto cx = node["cx"].get<double>();
++	const auto cy = node["cy"].get<double>();
++	const auto k0 = node["k0"].get<double>();
++	const auto k1 = node["k1"].get<double>();
++	const auto k2 = node["k2"].get<double>();
++	const auto k3 = node["k3"].get<double>();
++	const auto k4 = node["k4"].get<double>();
++
++	if (!cx || !cy || !k0 || !k1 || !k2 || !k3 || !k4)
++		return {};
++
++	return ipa::LscPolynomial(*cx, *cy, *k0, *k1, *k2, *k3, *k4);
++}
++
++} /* namespace */
++
++void LensShadingCorrection::sampleInto(const Component &component,
++				       float dst[DebayerParams::kLscGridHeight]
++						[DebayerParams::kLscGridWidth]) const
++{
++	if (component.poly)
++		samplePolynomial(*component.poly, dst);
++	else
++		sampleGrid(component.grid, dst);
++}
++
++/*
++ * Resample an explicit gain grid, whose nodes span the full frame with the
++ * first and last node on the frame edges, onto the backend's grid.
++ */
++void LensShadingCorrection::sampleGrid(const std::vector<float> &grid,
++				       float dst[DebayerParams::kLscGridHeight]
++						[DebayerParams::kLscGridWidth]) const
++{
++	const unsigned int gw = gridWidth_, gh = gridHeight_;
++	for (unsigned int y = 0; y < DebayerParams::kLscGridHeight; y++) {
++		const double v = static_cast<double>(y) / (DebayerParams::kLscGridHeight - 1) * (gh - 1);
++		const unsigned int y0 = std::min<unsigned int>(static_cast<unsigned int>(v), gh - 2);
++		const double fy = v - y0;
++		for (unsigned int x = 0; x < DebayerParams::kLscGridWidth; x++) {
++			const double u = static_cast<double>(x) / (DebayerParams::kLscGridWidth - 1) * (gw - 1);
++			const unsigned int x0 = std::min<unsigned int>(static_cast<unsigned int>(u), gw - 2);
++			const double fx = u - x0;
++			const double top = grid[y0 * gw + x0] * (1 - fx) + grid[y0 * gw + x0 + 1] * fx;
++			const double bottom = grid[(y0 + 1) * gw + x0] * (1 - fx) + grid[(y0 + 1) * gw + x0 + 1] * fx;
++			dst[y][x] = static_cast<float>(top * (1 - fy) + bottom * fy);
++		}
++	}
++}
++
++int LensShadingCorrection::init(IPAContext &context, const ValueNode &tuningData)
++{
++	const ValueNode &sets = tuningData["sets"];
++	if (!sets.isList()) {
++		LOG(IPASoftLsc, Error) << "'sets' not found in tuning data";
++		return -EINVAL;
++	}
++
++	/*
++	 * type: polynomial (default) - radial polynomials per component;
++	 * type: grid - explicit gain grids of width x height nodes per
++	 * component, spanning the full frame, e.g. per-unit calibration data.
++	 */
++	const std::string type = tuningData["type"].get<std::string>("polynomial");
++	const bool useGrid = type == "grid";
++	if (useGrid) {
++		gridWidth_ = tuningData["width"].get<uint32_t>(0);
++		gridHeight_ = tuningData["height"].get<uint32_t>(0);
++		if (gridWidth_ < 2 || gridHeight_ < 2) {
++			LOG(IPASoftLsc, Error) << "Grid shading needs 'width' and 'height' >= 2";
++			return -EINVAL;
++		}
++	} else if (type != "polynomial") {
++		LOG(IPASoftLsc, Error) << "Unknown shading type '" << type << "'";
++		return -EINVAL;
++	}
++
++	for (const auto &set : sets.asList()) {
++		const auto ct = set["ct"].get<uint32_t>();
++		if (!ct) {
++			LOG(IPASoftLsc, Error) << "A shading set has no 'ct'";
++			return -EINVAL;
++		}
++
++		Components components;
++		for (const char *key : kComponents) {
++			Component component;
++			if (useGrid) {
++				const ValueNode &list = set[key];
++				if (list.isList()) {
++					for (const auto &v : list.asList())
++						component.grid.push_back(static_cast<float>(v.get<double>(1.0)));
++				}
++				if (component.grid.size() != gridWidth_ * gridHeight_) {
++					LOG(IPASoftLsc, Error)
++						<< "Shading set " << *ct << " component '" << key
++						<< "' needs " << gridWidth_ * gridHeight_ << " values";
++					return -EINVAL;
++				}
++			} else {
++				auto poly = parsePolynomial(set[key]);
++				if (!poly) {
++					LOG(IPASoftLsc, Error)
++						<< "Shading set " << *ct
++						<< " is missing or has an incomplete '"
++						<< key << "' polynomial";
++					return -EINVAL;
++				}
++				component.poly = *poly;
++			}
++			components.emplace(key, std::move(component));
++		}
++
++		sets_[*ct] = std::move(components);
++	}
++
++	if (sets_.empty()) {
++		LOG(IPASoftLsc, Error) << "No shading sets were loaded";
++		return -EINVAL;
++	}
++
++	context.lscEnabled = true;
++	LOG(IPASoftLsc, Debug) << "Loaded " << sets_.size() << " shading sets";
++
++	return 0;
++}
++
++int LensShadingCorrection::configure(IPAContext &context,
++				     [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	sensorSize_ = context.sensorInfo.activeAreaSize;
++	crop_ = context.sensorInfo.analogCrop;
++	lastCt_ = 0;
++
++	/*
++	 * The polynomials are defined over the whole active pixel array, so
++	 * that is the reference the radius is normalised against.
++	 */
++	for (auto &[ct, components] : sets_)
++		for (auto &[key, component] : components)
++			if (component.poly)
++				component.poly->setReferenceImageSize(sensorSize_);
++
++	LOG(IPASoftLsc, Debug)
++		<< "Shading over crop " << crop_ << " of active area " << sensorSize_;
++
++	return 0;
++}
++
++/*
++ * Evaluate one polynomial on the correction grid. Grid nodes span the analogue
++ * crop, which is the part of the pixel array the sensor actually reads out.
++ */
++void LensShadingCorrection::samplePolynomial(const ipa::LscPolynomial &poly,
++				       float dst[DebayerParams::kLscGridHeight]
++						[DebayerParams::kLscGridWidth]) const
++{
++	const double m = poly.getM();
++	const double x0 = crop_.x / m;
++	const double y0 = crop_.y / m;
++	const double w = crop_.width / m;
++	const double h = crop_.height / m;
++
++	for (unsigned int gy = 0; gy < DebayerParams::kLscGridHeight; gy++) {
++		const double y = static_cast<double>(gy) /
++				 (DebayerParams::kLscGridHeight - 1);
++
++		for (unsigned int gx = 0; gx < DebayerParams::kLscGridWidth; gx++) {
++			const double x = static_cast<double>(gx) /
++					 (DebayerParams::kLscGridWidth - 1);
++
++			dst[gy][gx] = static_cast<float>(
++				poly.sampleAtNormalizedPixelPos(x0 + x * w,
++								y0 + y * h));
++		}
++	}
++}
++
++void LensShadingCorrection::prepare(IPAContext &context,
++				    [[maybe_unused]] const uint32_t frame,
++				    [[maybe_unused]] IPAFrameContext &frameContext,
++				    DebayerParams *params)
++{
++	if (sets_.empty()) {
++		params->shading.width = 0;
++		params->shading.height = 0;
++		context.activeState.lsc.meanGain = 1.0f;
++		context.activeState.lsc.valid = false;
++		return;
++	}
++
++	/*
++	 * The colour temperature comes from AWB, which in turn evaluates the
++	 * image through these grids. Follow a smoothed estimate and blend the
++	 * two neighbouring sets instead of switching between them: a hard
++	 * switch at a set boundary changes the colour, which moves the
++	 * estimate back across the boundary, and the two then flip every
++	 * statistics period (seen as a green flicker every four frames).
++	 */
++	const double ctNow = context.activeState.awb.temperatureK;
++	ctFiltered_ = ctFiltered_ > 0.0 ? 0.7 * ctFiltered_ + 0.3 * ctNow : ctNow;
++	const unsigned int ct = static_cast<unsigned int>(std::lround(ctFiltered_));
++
++	if (lastCt_ &&
++	    std::abs(static_cast<int>(ct) - static_cast<int>(lastCt_)) < 25)
++		return;
++
++	lastCt_ = ct;
++
++	auto hi = sets_.lower_bound(ct);
++	auto lo = hi;
++	double t = 0.0;
++	if (hi == sets_.end()) {
++		--hi;
++		lo = hi;
++	} else if (hi != sets_.begin() && hi->first != ct) {
++		lo = std::prev(hi);
++		t = static_cast<double>(ct - lo->first) / (hi->first - lo->first);
++	}
++
++	auto sampleBlend = [&](const char *name,
++			       float dst[DebayerParams::kLscGridHeight][DebayerParams::kLscGridWidth]) {
++		sampleInto(lo->second.find(name)->second, dst);
++		if (t <= 0.0)
++			return;
++		float other[DebayerParams::kLscGridHeight][DebayerParams::kLscGridWidth];
++		sampleInto(hi->second.find(name)->second, other);
++		for (unsigned int y = 0; y < DebayerParams::kLscGridHeight; y++)
++			for (unsigned int x = 0; x < DebayerParams::kLscGridWidth; x++)
++				dst[y][x] = static_cast<float>(dst[y][x] * (1.0 - t) + other[y][x] * t);
++	};
++	sampleBlend("r", params->shading.r);
++	sampleBlend("gr", params->shading.gr);
++	sampleBlend("gb", params->shading.gb);
++	sampleBlend("b", params->shading.b);
++	const unsigned int setLo = lo->first, setHi = hi->first;
++
++	/*
++	 * The grids are applied as they are: AWB evaluates the colour of the
++	 * corrected image from zoned statistics and the grids themselves, so
++	 * any global per-channel scale in them is absorbed by the white
++	 * balance gains, and the spatial colour correction is preserved
++	 * everywhere, including the image centre. Only the mean green gain is
++	 * needed elsewhere, by AGC, to judge the brightness of the output.
++	 */
++	auto mean = [](const float grid[DebayerParams::kLscGridHeight]
++				       [DebayerParams::kLscGridWidth]) {
++		double sum = 0.0;
++		for (unsigned int y = 0; y < DebayerParams::kLscGridHeight; y++)
++			for (unsigned int x = 0; x < DebayerParams::kLscGridWidth; x++)
++				sum += grid[y][x];
++		return sum / (DebayerParams::kLscGridHeight * DebayerParams::kLscGridWidth);
++	};
++	const double meanG = (mean(params->shading.gr) + mean(params->shading.gb)) / 2.0;
++	context.activeState.lsc.meanGain = static_cast<float>(meanG);
++
++	static_assert(DebayerParams::kLscGridWidth == 17 && DebayerParams::kLscGridHeight == 17);
++	std::copy(&params->shading.r[0][0], &params->shading.r[0][0] + 17 * 17, &context.activeState.lsc.r[0][0]);
++	std::copy(&params->shading.gr[0][0], &params->shading.gr[0][0] + 17 * 17, &context.activeState.lsc.gr[0][0]);
++	std::copy(&params->shading.gb[0][0], &params->shading.gb[0][0] + 17 * 17, &context.activeState.lsc.gb[0][0]);
++	std::copy(&params->shading.b[0][0], &params->shading.b[0][0] + 17 * 17, &context.activeState.lsc.b[0][0]);
++	context.activeState.lsc.valid = true;
++
++	LOG(IPASoftLsc, Debug) << "Shading set " << setLo << "-" << setHi << " K (t " << t << ") for ct "
++			       << ct << ", mean gain " << meanG
++			       << ", centre r/gr/gb/b " << params->shading.r[8][8] << "/"
++			       << params->shading.gr[8][8] << "/" << params->shading.gb[8][8] << "/"
++			       << params->shading.b[8][8] << ", corner r/gr/gb/b "
++			       << params->shading.r[0][0] << "/" << params->shading.gr[0][0] << "/"
++			       << params->shading.gb[0][0] << "/" << params->shading.b[0][0];
++
++	params->shading.width = DebayerParams::kLscGridWidth;
++	params->shading.height = DebayerParams::kLscGridHeight;
++}
++
++REGISTER_IPA_ALGORITHM(LensShadingCorrection, "LensShadingCorrection")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/lsc.h libcamera-work/src/ipa/simple/algorithms/lsc.h
+--- srpm/src/src/ipa/simple/algorithms/lsc.h	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/ipa/simple/algorithms/lsc.h	2026-10-28 16:36:08.716064593 -0400
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP lens shading correction
++ */
++
++#pragma once
++
++#include <map>
++#include <optional>
++#include <vector>
++#include <string>
++
++#include "libcamera/internal/value_node.h"
++
++#include "libipa/lsc_polynomial.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class LensShadingCorrection : public Algorithm
++{
++public:
++	LensShadingCorrection() = default;
++	~LensShadingCorrection() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	/*
++	 * One shading component: either a radial polynomial (type: polynomial)
++	 * or an explicit gain grid spanning the full frame (type: grid), e.g.
++	 * the per-unit calibration from the module's EEPROM.
++	 */
++	struct Component {
++		std::optional<ipa::LscPolynomial> poly;
++		std::vector<float> grid;
++	};
++	using Components = std::map<std::string, Component, std::less<>>;
++
++	void sampleInto(const Component &component,
++			float dst[DebayerParams::kLscGridHeight]
++				 [DebayerParams::kLscGridWidth]) const;
++	void samplePolynomial(const ipa::LscPolynomial &poly,
++			      float dst[DebayerParams::kLscGridHeight]
++				       [DebayerParams::kLscGridWidth]) const;
++	void sampleGrid(const std::vector<float> &grid,
++			float dst[DebayerParams::kLscGridHeight]
++				 [DebayerParams::kLscGridWidth]) const;
++
++	unsigned int gridWidth_ = 0;
++	unsigned int gridHeight_ = 0;
++
++	std::map<unsigned int, Components> sets_;
++	Rectangle crop_;
++	Size sensorSize_;
++	unsigned int lastCt_ = 0;
++	double ctFiltered_ = 0.0;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/algorithms/meson.build libcamera-work/src/ipa/simple/algorithms/meson.build
+--- srpm/src/src/ipa/simple/algorithms/meson.build	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/algorithms/meson.build	2026-10-28 13:31:08.085835128 -0400
+@@ -6,4 +6,6 @@
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'denoise.cpp',
++    'lsc.cpp',
+ ])
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/data/imx471.yaml libcamera-work/src/ipa/simple/data/imx471.yaml
+--- srpm/src/src/ipa/simple/data/imx471.yaml	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/ipa/simple/data/imx471.yaml	2026-10-27 22:27:12.326660361 -0400
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# Sony IMX471 as fitted to the Lenovo ThinkPad X1 Carbon Gen 14.
++#
++# Black level is the sensor pedestal of 64 DN at 10 bits, in the 16 bit
++# units the BlackLevel algorithm expects (64 << 6).
++#
++# Lens shading gains use 1024 for unity, as the rkisp1 tuning files do.
++# The grids cover the full active pixel array; libipa resamples them for
++# whatever the sensor reports as its analogue crop.
++#
++# Colour matrices are applied after white balance and each row sums to
++# one, so a neutral input stays neutral.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - LensShadingCorrection:
++      # Polynomial rather than tabular: LscTable cannot resample its
++      # grids for the sensor's analogue crop, and this sensor reads
++      # out 3856x2176 of its 4656x3496 array.
++      type: polynomial
++      sets:
++        - ct: 2694
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.232229
++            k1: 1.915956
++            k2: -14.198143
++            k3: 119.530090
++            k4: -142.976535
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.920948
++            k1: -19.683118
++            k2: 85.355875
++            k3: -81.816705
++            k4: -2.060203
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 7.077360
++            k1: -22.382449
++            k2: 98.141051
++            k3: -105.649614
++            k4: 13.571106
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 8.171521
++            k1: -38.310003
++            k2: 170.954282
++            k3: -245.436970
++            k4: 102.751629
++        - ct: 2784
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.226037
++            k1: 11.073734
++            k2: -74.125876
++            k3: 252.645405
++            k4: -233.984590
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.667568
++            k1: -0.577362
++            k2: -19.064756
++            k3: 140.945685
++            k4: -157.090270
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.671206
++            k1: -0.411480
++            k2: -21.170422
++            k3: 147.394508
++            k4: -162.495936
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.052429
++            k1: -3.462263
++            k2: -16.376015
++            k3: 152.234446
++            k4: -173.939470
++        - ct: 3615
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.010856
++            k1: 13.168908
++            k2: -88.904793
++            k3: 282.242117
++            k4: -251.237449
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.438938
++            k1: 2.429768
++            k2: -37.511897
++            k3: 180.480346
++            k4: -182.394238
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.348225
++            k1: 4.108769
++            k2: -46.949139
++            k3: 201.032522
++            k4: -197.290819
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.785844
++            k1: -0.926603
++            k2: -31.545241
++            k3: 184.581931
++            k4: -194.789394
++        - ct: 4656
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.715300
++            k1: 5.886968
++            k2: -41.597981
++            k3: 185.498864
++            k4: -191.226206
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.470832
++            k1: -15.162845
++            k2: 56.971950
++            k3: -14.009118
++            k4: -52.529325
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.451844
++            k1: -15.003759
++            k2: 55.636071
++            k3: -10.165509
++            k4: -55.719439
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 7.116974
++            k1: -25.946604
++            k2: 102.546829
++            k3: -92.791874
++            k4: -6.017692
++        - ct: 5694
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.576617
++            k1: 7.416494
++            k2: -51.072650
++            k3: 205.590949
++            k4: -204.634659
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.291010
++            k1: -12.237752
++            k2: 39.313214
++            k3: 24.817206
++            k4: -79.980926
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.361141
++            k1: -13.343367
++            k2: 44.397609
++            k3: 15.754901
++            k4: -74.312527
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.748991
++            k1: -19.059683
++            k2: 65.432697
++            k3: -15.595871
++            k4: -59.388143
++  - Awb:
++  - Ccm:
++      ccms:
++        - ct: 2694
++          ccm: [  1.5632, -0.3171, -0.2461,
++                 -0.4703,  1.6967, -0.2264,
++                  0.0009, -0.9716,  1.9707 ]
++        - ct: 2784
++          ccm: [  1.6169, -0.4751, -0.1418,
++                 -0.4882,  1.6958, -0.2075,
++                  0.0066, -0.7474,  1.7407 ]
++        - ct: 3615
++          ccm: [  1.6768, -0.5785, -0.0983,
++                 -0.3825,  1.5926, -0.2101,
++                 -0.0014, -0.6058,  1.6072 ]
++        - ct: 4656
++          ccm: [  1.5392, -0.3893, -0.1500,
++                 -0.2889,  1.5346, -0.2457,
++                  0.0005, -0.5633,  1.5628 ]
++        - ct: 5694
++          ccm: [  1.5414, -0.4120, -0.1293,
++                 -0.2660,  1.6099, -0.3438,
++                 -0.0014, -0.5417,  1.5431 ]
++  - Adjust:
++  - Agc:
++...
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/data/meson.build libcamera-work/src/ipa/simple/data/meson.build
+--- srpm/src/src/ipa/simple/data/meson.build	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/data/meson.build	2026-10-27 22:27:12.326783159 -0400
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'imx471.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/ipa_context.h libcamera-work/src/ipa/simple/ipa_context.h
+--- srpm/src/src/ipa/simple/ipa_context.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/ipa_context.h	2026-10-28 14:56:47.216786817 -0400
+@@ -29,6 +29,22 @@
+ 		int32_t exposureMin, exposureMax;
+ 		double againMin, againMax, again10, againMinStep;
+ 		utils::Duration lineDuration;
++		/*
++		 * Frame length control. The exposure limit is frameHeight +
++		 * vblank - exposureMargin. vblankMax is the longest blanking
++		 * the IPA is allowed to use in low light (half the nominal
++		 * frame rate); vblankDef is the sensor's default, i.e. the
++		 * nominal frame rate. vblankDef == 0 disables the feature.
++		 */
++		int32_t frameHeight, exposureMargin;
++		int32_t vblankMin, vblankDef, vblankMax;
++		/*
++		 * Analogue gain above which the frame is lengthened (lower
++		 * frame rate, longer exposure) before more gain is applied.
++		 * From the tuning file; a value at or above the gain limit
++		 * keeps the nominal frame rate until the gain runs out.
++		 */
++		double longExposureGain;
+ 	} agc;
+ 	struct {
+ 		std::optional<uint8_t> level;
+@@ -39,6 +55,7 @@
+ 	struct {
+ 		int32_t exposure;
+ 		double again;
++		int32_t vblank;
+ 		bool valid;
+ 	} agc;
+ 
+@@ -53,6 +70,26 @@
+ 		unsigned int temperatureK;
+ 	} awb;
+ 
++	struct {
++		/*
++		 * Mean lens shading gain over the frame. The statistics are taken
++		 * before shading correction, so AGC needs this to judge the
++		 * brightness of the corrected output.
++		 */
++		float meanGain;
++		/*
++		 * The gain grids in use (sensor frame coordinates), so that AWB
++		 * can evaluate the colour of the corrected image from raw
++		 * statistics. Not valid until the first prepare().
++		 */
++		bool valid;
++		float r[17][17], gr[17][17], gb[17][17], b[17][17];
++	} lsc;
++
++	struct {
++		/* Analogue gain of the most recent frame with statistics. */
++		double gain;
++	} denoise;
+ 	Matrix<float, 3, 3> combinedMatrix;
+ 
+ 	struct {
+@@ -69,6 +106,7 @@
+ 	struct {
+ 		int32_t exposure;
+ 		double gain;
++		int32_t vblank;
+ 	} sensor;
+ 
+ 	RGB<float> gains;
+@@ -90,6 +128,8 @@
+ 	FCQueue<IPAFrameContext> frameContexts;
+ 	ControlInfoMap::Map ctrlMap;
+ 	bool ccmEnabled = false;
++	bool lscEnabled = false;
++	bool denoiseEnabled = false;
+ };
+ 
+ } /* namespace ipa::soft */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/ipa/simple/soft_simple.cpp libcamera-work/src/ipa/simple/soft_simple.cpp
+--- srpm/src/src/ipa/simple/soft_simple.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/ipa/simple/soft_simple.cpp	2026-10-28 13:29:42.210957764 -0400
+@@ -57,7 +57,8 @@
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
+ 		 ControlInfoMap *ipaControls,
+-		 bool *ccmEnabled) override;
++		 bool *ccmEnabled, bool *lscEnabled,
++		 bool *denoiseEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+ 
+ 	int start() override;
+@@ -97,7 +98,8 @@
+ 			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
+ 			ControlInfoMap *ipaControls,
+-			bool *ccmEnabled)
++			bool *ccmEnabled, bool *lscEnabled,
++			bool *denoiseEnabled)
+ {
+ 	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
+ 	if (!camHelper_) {
+@@ -136,6 +138,8 @@
+ 		return ret;
+ 
+ 	*ccmEnabled = context_.ccmEnabled;
++	*lscEnabled = context_.lscEnabled;
++	*denoiseEnabled = context_.denoiseEnabled;
+ 
+ 	params_ = nullptr;
+ 	stats_ = nullptr;
+@@ -215,6 +219,36 @@
+ 		context_.sensorInfo.minLineLength * 1.0s / context_.sensorInfo.pixelRate;
+ 	context_.configuration.agc.exposureMin = exposureInfo.min().get<int32_t>();
+ 	context_.configuration.agc.exposureMax = exposureInfo.max().get<int32_t>();
++
++	/*
++	 * Frame length control for low light: remember the sensor's blanking
++	 * range and derive the exposure margin from the default frame length.
++	 * Allow at most twice the nominal frame length (half the frame rate).
++	 */
++	context_.configuration.agc.vblankDef = 0;
++	const auto vblankIt = sensorInfoMap_.find(V4L2_CID_VBLANK);
++	if (vblankIt != sensorInfoMap_.end()) {
++		const ControlInfo &vblankInfo = vblankIt->second;
++		const int32_t height = context_.sensorInfo.outputSize.height;
++		const int32_t vblankDef = vblankInfo.def().get<int32_t>();
++		const int32_t frameLength = height + vblankDef;
++		int32_t margin = frameLength - context_.configuration.agc.exposureMax;
++		if (height > 0 && vblankDef > 0 && margin >= 0) {
++			context_.configuration.agc.frameHeight = height;
++			context_.configuration.agc.exposureMargin = margin;
++			context_.configuration.agc.vblankMin = vblankInfo.min().get<int32_t>();
++			context_.configuration.agc.vblankDef = vblankDef;
++			context_.configuration.agc.vblankMax =
++				std::min(vblankInfo.max().get<int32_t>(),
++					 2 * frameLength - height);
++			LOG(IPASoft, Info)
++				<< "Frame length " << frameLength << " lines (vblank "
++				<< vblankDef << "), extendable to "
++				<< height + context_.configuration.agc.vblankMax
++				<< ", exposure margin " << margin;
++		}
++	}
++	context_.activeState.agc.vblank = context_.configuration.agc.vblankDef;
+ 	if (!context_.configuration.agc.exposureMin) {
+ 		LOG(IPASoft, Warning) << "Minimum exposure is zero, that can't be linear";
+ 		context_.configuration.agc.exposureMin = 1;
+@@ -305,6 +339,9 @@
+ 		sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
+ 	int32_t again = sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
+ 	frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
++	frameContext.sensor.vblank = sensorControls.contains(V4L2_CID_VBLANK)
++					     ? sensorControls.get(V4L2_CID_VBLANK).get<int32_t>()
++					     : context_.configuration.agc.vblankDef;
+ 
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+@@ -324,6 +361,9 @@
+ 	ctrls.set(V4L2_CID_EXPOSURE, frameContext.sensor.exposure);
+ 	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
+ 		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
++	if (context_.configuration.agc.vblankDef &&
++	    sensorInfoMap_.find(V4L2_CID_VBLANK) != sensorInfoMap_.end())
++		ctrls.set(V4L2_CID_VBLANK, frameContext.sensor.vblank);
+ 
+ 	setSensorControls.emit(ctrls);
+ }
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/pipeline/simple/simple.cpp libcamera-work/src/libcamera/pipeline/simple/simple.cpp
+--- srpm/src/src/libcamera/pipeline/simple/simple.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/pipeline/simple/simple.cpp	2026-10-28 08:01:40.132133533 -0400
+@@ -570,6 +570,9 @@
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+ 		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+ 	};
++	/* The software IPA extends the frame length in low light. */
++	if (sensor_->controls().find(V4L2_CID_VBLANK) != sensor_->controls().end())
++		params[V4L2_CID_VBLANK] = { delays.vblankDelay, false };
+ 	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
+ 
+ 	LOG(SimplePipeline, Debug)
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/sensor/camera_sensor_properties.cpp libcamera-work/src/libcamera/sensor/camera_sensor_properties.cpp
+--- srpm/src/src/libcamera/sensor/camera_sensor_properties.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/sensor/camera_sensor_properties.cpp	2026-10-28 14:13:11.579976515 -0400
+@@ -335,6 +335,23 @@
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "ov02c10", {
++			.unitCellSize = { 1116, 1116 },
++			.testPatternModes = { },
++			/*
++			 * Exposure and gain both take effect two frames after
++			 * they are written. With the default delays (gain one
++			 * frame earlier) a joint exposure-up/gain-down change
++			 * lands on two different frames and shows as a one
++			 * frame brightness pulse.
++			 */
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2,
++			},
++		} },
+ 		{ "ov2685", {
+ 			.unitCellSize = { 1750, 1750 },
+ 			.testPatternModes = {
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/bayer_unpacked.frag libcamera-work/src/libcamera/shaders/bayer_unpacked.frag
+--- srpm/src/src/libcamera/shaders/bayer_unpacked.frag	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/shaders/bayer_unpacked.frag	2026-10-28 14:35:18.549146104 -0400
+@@ -25,10 +25,22 @@
+ varying vec4            yCoord;
+ varying vec4            xCoord;
+ uniform vec3            awb;
++uniform vec2            tex_step;
+ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
++#if defined(LSC_ENABLED)
++/*
++ * Lens shading gains on a small grid covering the sensor's analogue crop,
++ * stored as 8 bit (gain - lscOffset) / lscScale so no float texture extension
++ * is needed. GL_LINEAR interpolates between grid nodes for free.
++ */
++uniform sampler2D       lsc;
++uniform float           lscScale;
++uniform float           lscOffset;
++varying vec2            lscCoord;
++#endif
+ 
+ float apply_contrast(float value)
+ {
+@@ -52,17 +64,30 @@
+     #define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
+     #endif
+ 
+-    float C = fetch(center.x, center.y); // ( 0, 0)
++    /*
++     * center.xy (sample position) and center.zw (pixel index used for the
++     * Bayer phase below) are interpolated separately. When the output is
++     * scaled their rounding can disagree, and a whole row or column is then
++     * demosaiced with the wrong phase (a magenta or green line). Snap the
++     * sample position, and the neighbour taps, to the centre of the texel
++     * the phase is computed from.
++     */
++    vec2 snap = (0.5 - fract(center.zw)) * tex_step;
++    vec2 cxy = center.xy + snap;
++    vec4 xC = xCoord + snap.x;
++    vec4 yC = yCoord + snap.y;
++
++    float C = fetch(cxy.x, cxy.y); // ( 0, 0)
+     const vec4 kC = vec4( 4.0,  6.0,  5.0,  5.0) / 8.0;
+ 
+     // Determine which of four types of pixels we are on.
+     vec2 alternate = mod(floor(center.zw), 2.0);
+ 
+     vec4 Dvec = vec4(
+-        fetch(xCoord[1], yCoord[1]),  // (-1,-1)
+-        fetch(xCoord[1], yCoord[2]),  // (-1, 1)
+-        fetch(xCoord[2], yCoord[1]),  // ( 1,-1)
+-        fetch(xCoord[2], yCoord[2])); // ( 1, 1)
++        fetch(xC[1], yC[1]),  // (-1,-1)
++        fetch(xC[1], yC[2]),  // (-1, 1)
++        fetch(xC[2], yC[1]),  // ( 1,-1)
++        fetch(xC[2], yC[2])); // ( 1, 1)
+ 
+     vec4 PATTERN = (kC.xyz * C).xyzz;
+ 
+@@ -73,16 +98,16 @@
+     Dvec.x  += Dvec.y;
+ 
+     vec4 value = vec4(
+-        fetch(center.x, yCoord[0]),   // ( 0,-2)
+-        fetch(center.x, yCoord[1]),   // ( 0,-1)
+-        fetch(xCoord[0], center.y),   // (-2, 0)
+-        fetch(xCoord[1], center.y));  // (-1, 0)
++        fetch(cxy.x, yC[0]),   // ( 0,-2)
++        fetch(cxy.x, yC[1]),   // ( 0,-1)
++        fetch(xC[0], cxy.y),   // (-2, 0)
++        fetch(xC[1], cxy.y));  // (-1, 0)
+ 
+     vec4 temp = vec4(
+-        fetch(center.x, yCoord[3]),   // ( 0, 2)
+-        fetch(center.x, yCoord[2]),   // ( 0, 1)
+-        fetch(xCoord[3], center.y),   // ( 2, 0)
+-        fetch(xCoord[2], center.y));  // ( 1, 0)
++        fetch(cxy.x, yC[3]),   // ( 0, 2)
++        fetch(cxy.x, yC[2]),   // ( 0, 1)
++        fetch(xC[3], cxy.y),   // ( 2, 0)
++        fetch(xC[2], cxy.y));  // ( 1, 0)
+ 
+     // Even the simplest compilers should be able to constant-fold these to
+     // avoid the division.
+@@ -135,6 +160,15 @@
+      */
+     rgb = (rgb - blacklevel) / (1.0 - blacklevel);
+ 
++#if defined(LSC_ENABLED)
++    /*
++     * Lens shading is a gain on the signal above black level, so it belongs
++     * here: after black level removal and before white balance. lscCoord is
++     * the position in the image on [0, 1], independent of the texture stride.
++     */
++    rgb *= lscOffset + texture2D(lsc, lscCoord).rgb * lscScale;
++#endif
++
+     /* Apply AWB gains, and saturate each channel at sensor range */
+     rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/bayer_unpacked.vert libcamera-work/src/libcamera/shaders/bayer_unpacked.vert
+--- srpm/src/src/libcamera/shaders/bayer_unpacked.vert	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/shaders/bayer_unpacked.vert	2026-10-27 23:07:52.962571109 -0400
+@@ -42,8 +42,16 @@
+ 
+ uniform float stride_factor;
+ 
++#if defined(LSC_ENABLED)
++/** Position in the image on [0, 1], for the lens shading grid. */
++varying vec2            lscCoord;
++#endif
++
+ void main(void) {
+     center.xy = vec2(textureIn.x * stride_factor, textureIn.y);
++#if defined(LSC_ENABLED)
++    lscCoord = textureIn;
++#endif
+     center.zw = textureIn * tex_size + tex_bayer_first_red;
+ 
+     xCoord = center.x + vec4(-2.0 * tex_step.x,
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/copy.frag libcamera-work/src/libcamera/shaders/copy.frag
+--- srpm/src/src/libcamera/shaders/copy.frag	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/libcamera/shaders/copy.frag	2026-10-29 08:35:41.972202419 -0400
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * copy.frag - Copy an intermediate RGB texture to the output buffer
++ *
++ * Used when the last processing pass has to render into a texture that is
++ * kept (the temporal denoise history) rather than into the output buffer.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++varying vec2 textureOut;
++uniform sampler2D tex_y;
++
++void main(void)
++{
++	gl_FragColor = vec4(texture2D(tex_y, textureOut).rgb, 1.0);
++}
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/denoise.frag libcamera-work/src/libcamera/shaders/denoise.frag
+--- srpm/src/src/libcamera/shaders/denoise.frag	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/libcamera/shaders/denoise.frag	2026-10-28 13:42:28.127029109 -0400
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * denoise.frag - Edge-preserving chroma (and light luma) denoise
++ *
++ * Second pass of the GPU software ISP. The input is the fully processed,
++ * gamma encoded RGB frame produced by the debayer pass at the output size.
++ * The image is split into luma and chroma; chroma is averaged over a square
++ * window with bilateral weights (close in space, close in chroma and close
++ * in luma) so that the colour speckle of a high gain frame is smoothed while
++ * real colour edges and luma edges stay sharp. Luma gets an optional, much
++ * weaker bilateral pass with its own sigma.
++ *
++ * All sigmas are in the [0, 1] range of the gamma encoded output.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++varying vec2 textureOut;
++uniform sampler2D tex_y;
++uniform vec2 tex_step;
++uniform float chromaSigma;
++uniform float lumaSigma;
++uniform float lumaStrength;
++
++#if !defined(DENOISE_RADIUS)
++#define DENOISE_RADIUS 3
++#endif
++
++/* Column-major: columns are the contributions of R, G and B (BT.601). */
++const mat3 rgb2yuv = mat3(0.299, -0.168736, 0.5,
++                          0.587, -0.331264, -0.418688,
++                          0.114, 0.5, -0.081312);
++const mat3 yuv2rgb = mat3(1.0, 1.0, 1.0,
++                          0.0, -0.344136, 1.772,
++                          1.402, -0.714136, 0.0);
++
++void main(void)
++{
++	vec3 centre = rgb2yuv * texture2D(tex_y, textureOut).rgb;
++
++	/*
++	 * Chroma is guided by luma with a wider sigma than the luma noise
++	 * itself, so a luma edge stops chroma bleeding across it while
++	 * luma noise alone does not break the chroma average up.
++	 */
++	float guideSigma = max(3.0 * lumaSigma, 2.0 * chromaSigma);
++	float invChroma2 = -0.5 / (chromaSigma * chromaSigma + 1e-8);
++	float invGuide2 = -0.5 / (guideSigma * guideSigma + 1e-8);
++	float invLuma2 = -0.5 / (lumaSigma * lumaSigma + 1e-8);
++	const float spatial = float(DENOISE_RADIUS) * 0.6;
++	float invSpatial2 = -0.5 / (spatial * spatial);
++
++	vec2 chroma = vec2(0.0);
++	float wChroma = 0.0;
++	float luma = 0.0;
++	float wLuma = 0.0;
++
++	for (int j = -DENOISE_RADIUS; j <= DENOISE_RADIUS; j++) {
++		for (int i = -DENOISE_RADIUS; i <= DENOISE_RADIUS; i++) {
++			vec2 off = vec2(float(i), float(j));
++			vec3 p = rgb2yuv * texture2D(tex_y, textureOut + off * tex_step).rgb;
++			float ws = dot(off, off) * invSpatial2;
++			float dy = p.x - centre.x;
++			vec2 dc = p.yz - centre.yz;
++
++			float wc = exp(ws + dot(dc, dc) * invChroma2 + dy * dy * invGuide2);
++			chroma += wc * p.yz;
++			wChroma += wc;
++
++			float wl = exp(ws + dy * dy * invLuma2);
++			luma += wl * p.x;
++			wLuma += wl;
++		}
++	}
++
++	vec3 yuv = vec3(mix(centre.x, luma / wLuma, lumaStrength), chroma / wChroma);
++	vec3 rgb = clamp(yuv2rgb * yuv, 0.0, 1.0);
++
++#if defined (SWAP_BLUE)
++	gl_FragColor = vec4(rgb.bgr, 1.0);
++#else
++	gl_FragColor = vec4(rgb, 1.0);
++#endif
++}
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/meson.build libcamera-work/src/libcamera/shaders/meson.build
+--- srpm/src/src/libcamera/shaders/meson.build	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/shaders/meson.build	2026-10-29 08:35:41.972707038 -0400
+@@ -6,7 +6,11 @@
+     'bayer_1x_packed.frag',
+     'bayer_unpacked.frag',
+     'bayer_unpacked.vert',
++    'copy.frag',
++    'denoise.frag',
+     'identity.vert',
++    'pack_yuyv.frag',
++    'temporal.frag',
+ ])
+ 
+ # Generate header from shaders
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/pack_yuyv.frag libcamera-work/src/libcamera/shaders/pack_yuyv.frag
+--- srpm/src/src/libcamera/shaders/pack_yuyv.frag	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/libcamera/shaders/pack_yuyv.frag	2026-10-28 15:17:41.610579068 -0400
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * pack_yuyv.frag - Pack the processed RGB frame as YUYV (4:2:2)
++ *
++ * The render target is the YUYV buffer imported as a 32 bit RGBA texture of
++ * half the width: every fragment produces one Y0 U Y1 V word from the two
++ * source pixels it covers. Chroma is the average of the pair (BT.601).
++ * Channel order in gl_FragColor follows the DRM_FORMAT_ARGB8888 import used
++ * for all outputs: .b lands in the first byte, .a in the last.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++varying vec2 textureOut;
++uniform sampler2D tex_y;
++uniform vec2 tex_step;	/* texel step of the (full width) source */
++
++const vec3 kY = vec3(0.299, 0.587, 0.114);
++const vec3 kU = vec3(-0.168736, -0.331264, 0.5);
++const vec3 kV = vec3(0.5, -0.418688, -0.081312);
++
++void main(void)
++{
++	vec3 c0 = texture2D(tex_y, vec2(textureOut.x - 0.5 * tex_step.x, textureOut.y)).rgb;
++	vec3 c1 = texture2D(tex_y, vec2(textureOut.x + 0.5 * tex_step.x, textureOut.y)).rgb;
++	vec3 avg = 0.5 * (c0 + c1);
++
++	float y0 = dot(c0, kY);
++	float y1 = dot(c1, kY);
++	float u = dot(avg, kU);
++	float v = dot(avg, kV);
++
++#if defined(LIMITED_RANGE)
++	y0 = 16.0 / 255.0 + y0 * (219.0 / 255.0);
++	y1 = 16.0 / 255.0 + y1 * (219.0 / 255.0);
++	u = 128.0 / 255.0 + u * (224.0 / 255.0);
++	v = 128.0 / 255.0 + v * (224.0 / 255.0);
++#else
++	u += 128.0 / 255.0;
++	v += 128.0 / 255.0;
++#endif
++
++	/* memory: Y0 U Y1 V  ==  .b .g .r .a */
++	gl_FragColor = vec4(y1, u, y0, v);
++}
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/shaders/temporal.frag libcamera-work/src/libcamera/shaders/temporal.frag
+--- srpm/src/src/libcamera/shaders/temporal.frag	1969-12-31 19:00:00.000000000 -0500
++++ libcamera-work/src/libcamera/shaders/temporal.frag	2026-10-29 08:44:25.145340736 -0400
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * temporal.frag - Motion-adaptive temporal (recursive) denoise
++ *
++ * Third pass of the GPU software ISP. The output of the previous frame is
++ * kept as a history texture and blended into the current frame where the
++ * picture has not changed: a recursive average with weight w on the history
++ * lowers the noise by sqrt((1 - w) / (1 + w)) (w = 0.75: to 38 %, 0.5: to
++ * 58 %). Luma and chroma have separate weights: a slowly moving smooth
++ * surface lags by w of each change, which the eye notices in luma but
++ * hardly in colour, while colour blotches are what the filter removes best.
++ *
++ * Motion is detected from the mean absolute difference between the current
++ * frame and the history over a 3x3 window (all three channels), so that
++ * noise alone does not read as motion. The thresholds are multiples of the
++ * expected per-pixel noise of the frame (from the IPA, by analogue gain):
++ * below motionLow sigmas the history is used with the full strength, above
++ * motionHigh it is dropped and the pixel is the current one. Any trail a
++ * moving object can leave is therefore of the order of the noise itself.
++ *
++ * sigma is in the [0, 1] range of the gamma encoded output.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++varying vec2 textureOut;
++uniform sampler2D tex_y;	/* current frame (spatially denoised) */
++uniform sampler2D tex_prev;	/* previous output of this pass */
++uniform vec2 tex_step;
++uniform float sigma;
++uniform float strength;		/* luma weight of the history */
++uniform float chromaStrength;	/* chroma weight of the history */
++uniform float motionLow;
++uniform float motionHigh;
++
++/* Column-major: columns are the contributions of R, G and B (BT.601). */
++const mat3 rgb2yuv = mat3(0.299, -0.168736, 0.5,
++                          0.587, -0.331264, -0.418688,
++                          0.114, 0.5, -0.081312);
++const mat3 yuv2rgb = mat3(1.0, 1.0, 1.0,
++                          0.0, -0.344136, 1.772,
++                          1.402, -0.714136, 0.0);
++
++void main(void)
++{
++	vec3 cur = texture2D(tex_y, textureOut).rgb;
++	vec3 prev = texture2D(tex_prev, textureOut).rgb;
++
++	float d = 0.0;
++	for (int j = -1; j <= 1; j++) {
++		for (int i = -1; i <= 1; i++) {
++			vec2 p = textureOut + vec2(float(i), float(j)) * tex_step;
++			vec3 diff = abs(texture2D(tex_y, p).rgb - texture2D(tex_prev, p).rgb);
++			d += diff.r + diff.g + diff.b;
++		}
++	}
++	/* Mean over 9 pixels and 3 channels. */
++	d *= 1.0 / 27.0;
++
++	float still = 1.0 - smoothstep(motionLow * sigma, motionHigh * sigma, d);
++	vec3 c = rgb2yuv * cur;
++	vec3 p = rgb2yuv * prev;
++	vec3 yuv = vec3(mix(c.x, p.x, strength * still),
++			mix(c.yz, p.yz, chromaStrength * still));
++	gl_FragColor = vec4(clamp(yuv2rgb * yuv, 0.0, 1.0), 1.0);
++}
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer.cpp libcamera-work/src/libcamera/software_isp/debayer.cpp
+--- srpm/src/src/libcamera/software_isp/debayer.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer.cpp	2026-10-28 15:57:15.815305535 -0400
+@@ -11,6 +11,15 @@
+ 
+ #include "debayer.h"
+ 
++#include <libcamera/base/utils.h>
++
++#include <chrono>
++#include <thread>
++#include <vector>
++
++#include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++
+ namespace libcamera {
+ 
+ /**
+@@ -300,4 +309,135 @@
+ 	       order == BayerFormat::GRBG || order == BayerFormat::RGGB;
+ }
+ 
++
++#if defined(__x86_64__) || defined(__i386__)
++static bool cpuHasClflushopt()
++{
++	unsigned int eax, ebx, ecx, edx;
++	__asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
++	return ebx & (1u << 23);
++}
++#endif
++
++/**
++ * \brief Invalidate the CPU caches for the content of an input buffer
++ * \param[in] input The buffer about to be read
++ */
++void Debayer::invalidateInputCache(FrameBuffer *input)
++{
++	static const bool disabled = utils::secure_getenv("LIBCAMERA_SOFTISP_NOFLUSH") != nullptr;
++	if (!disabled)
++		flushInputCache(input);
++}
++
++/**
++ * \brief Flush and invalidate the CPU caches for an input buffer, unconditionally
++ * \param[in] input The buffer
++ */
++void Debayer::flushInputCache(FrameBuffer *input)
++{
++#if defined(__x86_64__) || defined(__i386__)
++	static const bool haveOpt = cpuHasClflushopt();
++
++	const int fd = input->planes()[0].fd.get();
++	auto it = inputMaps_.find(fd);
++	if (it == inputMaps_.end()) {
++		if (inputMaps_.size() >= 16)
++			inputMaps_.clear();
++		auto map = std::make_unique<MappedFrameBuffer>(input, MappedFrameBuffer::MapFlag::Read);
++		if (!map->isValid())
++			return;
++		it = inputMaps_.emplace(fd, std::move(map)).first;
++	}
++
++	for (const auto &plane : it->second->planes()) {
++		uint8_t *p = const_cast<uint8_t *>(plane.data());
++		uint8_t *end = p + plane.size();
++		for (; p < end; p += 64) {
++			if (haveOpt)
++				__asm__ volatile("clflushopt %0" : "+m"(*p));
++			else
++				__asm__ volatile("clflush %0" : "+m"(*p));
++		}
++	}
++	__asm__ volatile("mfence" ::: "memory");
++#else
++	(void)input;
++#endif
++}
++
++
++/*
++ * Diagnostics (LIBCAMERA_SOFTISP_STALECHECK=1): compare the content of an input
++ * buffer with what the same buffer held when it was last processed. Live 64 byte
++ * chunks (10 bit samples, unclipped, not flat) that are bit-identical were not
++ * rewritten by the capture DMA. Counted right away and again after 15 ms, to
++ * tell writes that land late from writes that never land.
++ */
++void Debayer::staleCheck(FrameBuffer *input, unsigned int stride, unsigned int width, unsigned int height)
++{
++	const int fd = input->planes()[0].fd.get();
++	auto it = inputMaps_.find(fd);
++	if (it == inputMaps_.end()) {
++		auto map = std::make_unique<MappedFrameBuffer>(input, MappedFrameBuffer::MapFlag::Read);
++		if (!map->isValid())
++			return;
++		it = inputMaps_.emplace(fd, std::move(map)).first;
++	}
++	const uint8_t *data = it->second->planes()[0].data();
++	const size_t size = it->second->planes()[0].size();
++	const unsigned int rowBytes = width * 2;
++
++	unsigned int rowMin = height, rowMax = 0, rows = 0;
++	auto count = [&](const std::vector<uint8_t> &prev) {
++		unsigned int n = 0;
++		rowMin = height; rowMax = 0; rows = 0;
++		for (unsigned int y = 0; y < height; y++) {
++			unsigned int inRow = 0;
++			const uint8_t *row = data + (size_t)y * stride;
++			const uint8_t *old = prev.data() + (size_t)y * stride;
++			for (unsigned int c = 0; c + 64 <= rowBytes; c += 64) {
++				if (memcmp(row + c, old + c, 64))
++					continue;
++				const uint16_t *v = reinterpret_cast<const uint16_t *>(row + c);
++				uint16_t mn = 1023, mx = 0;
++				for (int k = 0; k < 32; k++) {
++					mn = std::min(mn, v[k]);
++					mx = std::max(mx, v[k]);
++				}
++				if (mx < 1000 && mx - mn > 6) {
++					n++;
++					inRow++;
++				}
++			}
++			if (inRow) {
++				rows++;
++				rowMin = std::min(rowMin, y);
++				rowMax = std::max(rowMax, y);
++			}
++		}
++		return n;
++	};
++
++	auto prev = staleCopies_.find(fd);
++	if (prev != staleCopies_.end() && prev->second.size() == size) {
++		unsigned int cached = count(prev->second);	/* as the CPU sees it, caches untouched */
++		flushInputCache(input);
++		unsigned int now = count(prev->second);		/* what memory holds */
++		unsigned int later[3] = {};
++		if (now) {
++			for (int i = 0; i < 3; i++) {
++				std::this_thread::sleep_for(std::chrono::milliseconds(i == 0 ? 15 : i == 1 ? 15 : 30));
++				flushInputCache(input);
++				later[i] = count(prev->second);
++			}
++		}
++		LOG(Debayer, Info) << "stalecheck seq " << input->metadata().sequence << " fd " << fd
++				   << ": old-content chunks: cached view " << cached
++				   << ", memory " << now << ", after 15/30/60 ms " << later[0] << "/" << later[1] << "/" << later[2]
++				   << (now ? " in rows " + std::to_string(rowMin) + "-" + std::to_string(rowMax) + " (" + std::to_string(rows) + " rows)" : "");
++	}
++	staleCopies_[fd].assign(data, data + size);
++}
++
+ } /* namespace libcamera */
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer_cpu.cpp libcamera-work/src/libcamera/software_isp/debayer_cpu.cpp
+--- srpm/src/src/libcamera/software_isp/debayer_cpu.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer_cpu.cpp	2026-10-28 15:48:59.774731351 -0400
+@@ -63,6 +63,28 @@
+ 	unsigned int lineBufferIndex_;
+ 	std::vector<uint8_t> lineBuffers_[kMaxLineBuffers];
+ 	bool enableInputMemcpy_;
++
++	/* Per-thread shading gain rows, see DebayerCpu::LscRow. */
++	std::vector<float> lscB_;
++	std::vector<float> lscG_;
++	std::vector<float> lscR_;
++
++	DebayerCpu::LscRow lscRowFor(unsigned int y)
++	{
++		if (!debayer_->lscEnabled_)
++			return { nullptr, nullptr, nullptr };
++
++		const unsigned int width = debayer_->window_.width;
++		if (lscB_.size() < width) {
++			lscB_.resize(width, 1.0f);
++			lscG_.resize(width, 1.0f);
++			lscR_.resize(width, 1.0f);
++		}
++
++		debayer_->computeLscRow(y, lscB_.data(), lscG_.data(), lscR_.data());
++
++		return { lscB_.data(), lscG_.data(), lscR_.data() };
++	}
+ };
+ 
+ /**
+@@ -131,21 +153,29 @@
+ #define GAMMA(value) \
+ 	*dst++ = gammaLut_[std::clamp(value, 0, static_cast<int>(gammaLut_.size()) - 1)]
+ 
+-#define STORE_PIXEL(b_, g_, r_)                         \
+-	if constexpr (ccmEnabled) {                     \
+-		const CcmColumn &blue = blueCcm_[b_];   \
+-		const CcmColumn &green = greenCcm_[g_]; \
+-		const CcmColumn &red = redCcm_[r_];     \
+-		GAMMA(blue.b + green.b + red.b);        \
+-		GAMMA(blue.g + green.g + red.g);        \
+-		GAMMA(blue.r + green.r + red.r);        \
+-	} else {                                        \
+-		*dst++ = blue_[b_];                     \
+-		*dst++ = green_[g_];                    \
+-		*dst++ = red_[r_];                      \
+-	}                                               \
+-	if constexpr (addAlphaByte)                     \
+-		*dst++ = 255;                           \
++#define LSC_INDEX(v_, c_, k_) \
++	(lscEnabled ? lscApply((v_), lsc.c_[x], lscBlack_[k_]) : (v_))
++
++#define STORE_PIXEL(b_, g_, r_)                                 \
++	{                                                       \
++		const int bIdx = LSC_INDEX(b_, b, 0);           \
++		const int gIdx = LSC_INDEX(g_, g, 1);           \
++		const int rIdx = LSC_INDEX(r_, r, 2);           \
++		if constexpr (ccmEnabled) {                     \
++			const CcmColumn &blue = blueCcm_[bIdx];  \
++			const CcmColumn &green = greenCcm_[gIdx];\
++			const CcmColumn &red = redCcm_[rIdx];    \
++			GAMMA(blue.b + green.b + red.b);        \
++			GAMMA(blue.g + green.g + red.g);        \
++			GAMMA(blue.r + green.r + red.r);        \
++		} else {                                        \
++			*dst++ = blue_[bIdx];                   \
++			*dst++ = green_[gIdx];                  \
++			*dst++ = red_[rIdx];                    \
++		}                                               \
++	}                                                       \
++	if constexpr (addAlphaByte)                             \
++		*dst++ = 255;                                   \
+ 	x++;
+ 
+ /*
+@@ -192,8 +222,8 @@
+ 		(prev[x] + curr[x - p] + curr[x + n] + next[x]) / (4 * (div)),         \
+ 		curr[x] / (div))
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint8_t)
+ 
+@@ -203,8 +233,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint8_t)
+ 
+@@ -214,8 +244,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -226,8 +256,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -238,8 +268,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -250,8 +280,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -262,8 +292,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -288,8 +318,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -309,8 +339,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -330,8 +360,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -351,8 +381,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 3 / 2;
+ 	const uint8_t *prev = src[0];
+@@ -369,8 +399,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 3 / 2;
+ 	const uint8_t *prev = src[0];
+@@ -387,8 +417,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 3 / 2;
+ 	const uint8_t *prev = src[0];
+@@ -405,8 +435,8 @@
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 3 / 2;
+ 	const uint8_t *prev = src[0];
+@@ -518,17 +548,24 @@
+ 	return 0;
+ }
+ 
+-#define SET_DEBAYER_METHODS(method0, method1)                                                                        \
+-	debayer0_ = addAlphaByte                                                                                     \
+-			    ? (ccmEnabled ? &DebayerCpu::method0<true, true> : &DebayerCpu::method0<true, false>)    \
+-			    : (ccmEnabled ? &DebayerCpu::method0<false, true> : &DebayerCpu::method0<false, false>); \
+-	debayer1_ = addAlphaByte                                                                                     \
+-			    ? (ccmEnabled ? &DebayerCpu::method1<true, true> : &DebayerCpu::method1<true, false>)    \
+-			    : (ccmEnabled ? &DebayerCpu::method1<false, true> : &DebayerCpu::method1<false, false>);
++#define SELECT_DEBAYER_METHOD(method, alpha)                            \
++	(ccmEnabled                                                     \
++		 ? (lscEnabled ? &DebayerCpu::method<alpha, true, true>  \
++			       : &DebayerCpu::method<alpha, true, false>) \
++		 : (lscEnabled ? &DebayerCpu::method<alpha, false, true> \
++			       : &DebayerCpu::method<alpha, false, false>))
++
++#define SET_DEBAYER_METHODS(method0, method1)                       \
++	debayer0_ = addAlphaByte                                    \
++			    ? SELECT_DEBAYER_METHOD(method0, true)  \
++			    : SELECT_DEBAYER_METHOD(method0, false); \
++	debayer1_ = addAlphaByte                                    \
++			    ? SELECT_DEBAYER_METHOD(method1, true)  \
++			    : SELECT_DEBAYER_METHOD(method1, false);
+ 
+ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat,
+ 				    PixelFormat outputFormat,
+-				    bool ccmEnabled)
++				    bool ccmEnabled, bool lscEnabled)
+ {
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputFormat);
+@@ -641,11 +678,15 @@
+ 
+ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  bool ccmEnabled)
++			  bool ccmEnabled, bool lscEnabled, bool denoiseEnabled)
+ {
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+ 
++	if (denoiseEnabled)
++		LOG(Debayer, Warning)
++			<< "Denoise is not implemented by the CPU debayer, ignoring";
++
+ 	if (stats_->configure(inputCfg, threads_.size()) != 0)
+ 		return -EINVAL;
+ 
+@@ -682,11 +723,12 @@
+ 
+ 	int ret = setDebayerFunctions(inputCfg.pixelFormat,
+ 				      outputCfg.pixelFormat,
+-				      ccmEnabled);
++				      ccmEnabled, lscEnabled);
+ 	if (ret != 0)
+ 		return -EINVAL;
+ 
+ 	ccmEnabled_ = ccmEnabled;
++	lscEnabled_ = lscEnabled;
+ 
+ 	/*
+ 	 * Lookup tables must be initialized because the initial value is used for
+@@ -701,6 +743,7 @@
+ 	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
+ 		    ~(inputConfig_.patternSize.height - 1);
+ 	window_.width = outputCfg.size.width;
++	inputSize_ = inputCfg.size;
+ 	window_.height = outputCfg.size.height;
+ 
+ 	/*
+@@ -896,13 +939,13 @@
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+@@ -911,14 +954,14 @@
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, yEnd, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(yEnd));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		/* next line may point outside of src, use prev. */
+ 		linePointers[2] = linePointers[0];
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(yEnd + 1));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+@@ -952,31 +995,91 @@
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine2(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer2(dst, linePointers);
++		debayer_->debayer2(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer3(dst, linePointers);
++		debayer_->debayer3(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+ }
+ 
++int DebayerCpu::lscApply(int value, float gain, float black)
++{
++	const float corrected = black + (value - black) * gain;
++
++	return std::clamp(static_cast<int>(corrected + 0.5f), 0,
++			  static_cast<int>(kRGBLookupSize) - 1);
++}
++
++/*
++ * Resample the coarse shading grids onto one output line. Doing this per line
++ * rather than per pixel keeps the inner loop to a single multiply-add, and the
++ * correction is far too smooth for the interpolation error to be visible.
++ */
++void DebayerCpu::computeLscRow(unsigned int y, float *b, float *g, float *r) const
++{
++	const auto &shading = params_.shading;
++	const unsigned int gw = shading.width;
++	const unsigned int gh = shading.height;
++	const unsigned int width = window_.width;
++
++	if (!gw || !gh)
++		return;
++
++	/*
++	 * The grids span the whole sensor frame (the IPA samples them over the
++	 * analogue crop); the output window is a centred part of it.
++	 */
++	const float fy = inputSize_.height > 1
++			       ? static_cast<float>(window_.y + y) * (gh - 1) / (inputSize_.height - 1)
++			       : 0.0f;
++	const unsigned int y0 = std::min<unsigned int>(fy, gh - 1);
++	const unsigned int y1 = std::min<unsigned int>(y0 + 1, gh - 1);
++	const float wy = fy - y0;
++
++	for (unsigned int x = 0; x < width; x++) {
++		const float fx = inputSize_.width > 1
++				       ? static_cast<float>(window_.x + x) * (gw - 1) / (inputSize_.width - 1)
++				       : 0.0f;
++		const unsigned int x0 = std::min<unsigned int>(fx, gw - 1);
++		const unsigned int x1 = std::min<unsigned int>(x0 + 1, gw - 1);
++		const float wx = fx - x0;
++
++		auto sample = [&](const float grid[DebayerParams::kLscGridHeight]
++					       [DebayerParams::kLscGridWidth]) {
++			const float top = grid[y0][x0] * (1.0f - wx) + grid[y0][x1] * wx;
++			const float bot = grid[y1][x0] * (1.0f - wx) + grid[y1][x1] * wx;
++			return top * (1.0f - wy) + bot * wy;
++		};
++
++		b[x] = sample(shading.b);
++		/*
++		 * The two green planes are averaged: the debayered green value
++		 * already mixes both Bayer greens, and they differ far less than
++		 * the interpolation error.
++		 */
++		g[x] = (sample(shading.gr) + sample(shading.gb)) / 2.0f;
++		r[x] = sample(shading.r);
++	}
++}
++
+ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ {
+ 	const float gamma = params.gamma;
+@@ -1014,6 +1117,15 @@
+ 	const RGB<float> gains = params.gains;
+ 	const RGB<float> div = (RGB<float>(kRGBLookupSize) - blackIndex).max(1.0);
+ 
++	/*
++	 * Black level in lookup-table index units, ordered blue, green, red to
++	 * match the arguments of STORE_PIXEL. Shading is a gain on the signal
++	 * above black, so the index transform has to pivot about this.
++	 */
++	lscBlack_[0] = blackIndex.b();
++	lscBlack_[1] = blackIndex.g();
++	lscBlack_[2] = blackIndex.r();
++
+ 	if (ccmEnabled_) {
+ 		if (gammaUpdateNeeded ||
+ 		    matrixChanged(params.combinedMatrix, params_.combinedMatrix) ||
+@@ -1067,6 +1179,8 @@
+ 
+ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output, const DebayerParams &params)
+ {
++	invalidateInputCache(input);
++
+ 	bench_.startFrame();
+ 
+ 	std::vector<DmaSyncer> dmaSyncers;
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer_cpu.h libcamera-work/src/libcamera/software_isp/debayer_cpu.h
+--- srpm/src/src/libcamera/software_isp/debayer_cpu.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer_cpu.h	2026-10-28 14:56:47.223255036 -0400
+@@ -37,7 +37,8 @@
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled, bool lscEnabled,
++		      bool denoiseEnabled) override;
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 	std::vector<PixelFormat> formats(PixelFormat input) override;
+ 	std::tuple<unsigned int, unsigned int>
+@@ -79,54 +80,86 @@
+ 	 * pointers are passed holding: src[0] = 2-lines-up, src[1] = 1-line-up
+ 	 * src[2] = current-line, src[3] = 1-line-down, src[4] = 2-lines-down.
+ 	 */
+-	using debayerFn = void (DebayerCpu::*)(uint8_t *dst, const uint8_t *src[]);
++	/*
++	 * Per-column lens shading gains for the line being debayered, in the
++	 * same blue/green/red order the STORE_PIXEL macro uses. The rows are
++	 * owned by the calling thread, so threads do not share them.
++	 */
++	struct LscRow {
++		const float *b;
++		const float *g;
++		const float *r;
++	};
++
++	/*
++	 * Shading is a gain on the signal above black level, so it must be
++	 * applied before the lookup tables fold in gamma. Transforming the
++	 * table index is equivalent and costs one multiply-add per channel.
++	 */
++	static int lscApply(int value, float gain, float black);
++
++	using debayerFn = void (DebayerCpu::*)(uint8_t *dst, const uint8_t *src[],
++					       const LscRow &lsc);
+ 
+-	void debayer0(uint8_t *dst, const uint8_t *src[]) { (this->*debayer0_)(dst, src); }
+-	void debayer1(uint8_t *dst, const uint8_t *src[]) { (this->*debayer1_)(dst, src); }
+-	void debayer2(uint8_t *dst, const uint8_t *src[]) { (this->*debayer2_)(dst, src); }
+-	void debayer3(uint8_t *dst, const uint8_t *src[]) { (this->*debayer3_)(dst, src); }
++	void debayer0(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer0_)(dst, src, lsc);
++	}
++	void debayer1(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer1_)(dst, src, lsc);
++	}
++	void debayer2(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer2_)(dst, src, lsc);
++	}
++	void debayer3(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer3_)(dst, src, lsc);
++	}
+ 
+ 	/* 8-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* unpacked 10-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* unpacked 12-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* CSI-2 packed 10-bit raw bayer format (all the 4 orders) */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* CSI-2 packed 12-bit raw bayer format (all the 4 orders) */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	int setDebayerFunctions(PixelFormat inputFormat,
+ 				PixelFormat outputFormat,
+-				bool ccmEnabled);
++				bool ccmEnabled, bool lscEnabled);
+ 	void updateGammaTable(const DebayerParams &params);
++	void computeLscRow(unsigned int y, float *b, float *g, float *r) const;
+ 	void updateLookupTables(const DebayerParams &params);
+ 
+ 	static constexpr unsigned int kRGBLookupSize = 256;
+@@ -147,6 +180,10 @@
+ 	std::array<double, kGammaLookupSize> gammaTable_;
+ 	LookupTable gammaLut_;
+ 	bool ccmEnabled_;
++	bool lscEnabled_ = false;
++	Size inputSize_;
++	/* Black level in lookup-table index units, blue/green/red. */
++	float lscBlack_[3] = { 0.0f, 0.0f, 0.0f };
+ 	DebayerParams params_;
+ 
+ 	debayerFn debayer0_;
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer_egl.cpp libcamera-work/src/libcamera/software_isp/debayer_egl.cpp
+--- srpm/src/src/libcamera/software_isp/debayer_egl.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer_egl.cpp	2026-10-29 08:44:25.166879577 -0400
+@@ -20,6 +20,7 @@
+ #include <libcamera/base/span.h>
+ #include <libcamera/base/utils.h>
+ 
++#include <libcamera/color_space.h>
+ #include <libcamera/formats.h>
+ 
+ #include "libcamera/internal/formats.h"
+@@ -58,7 +59,8 @@
+ 	std::vector<PixelFormat> outputFormats = { formats::XRGB8888,
+ 						   formats::ARGB8888,
+ 						   formats::XBGR8888,
+-						   formats::ABGR8888 };
++						   formats::ABGR8888,
++						   formats::YUYV };
+ 
+ 	if ((bayerFormat.bitDepth == 8 || bayerFormat.bitDepth == 10) &&
+ 	    bayerFormat.packing == BayerFormat::Packing::None &&
+@@ -104,12 +106,100 @@
+ 		return 0;
+ 	}
+ 
++	if (outputFormat == formats::YUYV) {
++		config.bpp = 16;
++		return 0;
++	}
++
+ 	LOG(Debayer, Info)
+ 		<< "Unsupported output format " << outputFormat;
+ 
+ 	return -EINVAL;
+ }
+ 
++
++/*
++ * Upload the lens shading grid as an 8 bit RGB texture.
++ *
++ * Gains are stored as (gain - minGain) / scale so that no float texture
++ * extension is required, with scale and offset sent alongside so the shader
++ * can undo it. Quantising
++ * against the actual range rather than a fixed maximum keeps the step small:
++ * for a 6.35x corner gain it is about 0.02, well under the error already
++ * present in the polynomial fit the grid came from.
++ */
++void DebayerEGL::uploadLscTexture(const DebayerParams &params)
++{
++	const unsigned int gw = params.shading.width;
++	const unsigned int gh = params.shading.height;
++
++	if (!gw || !gh)
++		return;
++
++	float maxGain = params.shading.r[0][0];
++	float minGain = maxGain;
++	for (unsigned int y = 0; y < gh; y++) {
++		for (unsigned int x = 0; x < gw; x++) {
++			maxGain = std::max({ maxGain, params.shading.r[y][x],
++					     params.shading.gr[y][x],
++					     params.shading.gb[y][x],
++					     params.shading.b[y][x] });
++			minGain = std::min({ minGain, params.shading.r[y][x],
++					     params.shading.gr[y][x],
++					     params.shading.gb[y][x],
++					     params.shading.b[y][x] });
++		}
++	}
++
++	/* Texels hold (gain - minGain) / scale, so gains below 1 are fine. */
++	const float scale = std::max(maxGain - minGain, 1e-3f);
++
++	std::vector<uint8_t> texels(gw * gh * 3);
++	for (unsigned int y = 0; y < gh; y++) {
++		for (unsigned int x = 0; x < gw; x++) {
++			/*
++			 * The two green planes are averaged: the demosaiced
++			 * green already mixes both Bayer greens.
++			 */
++			const float g = (params.shading.gr[y][x] +
++					 params.shading.gb[y][x]) / 2.0f;
++			const float c[3] = { params.shading.r[y][x], g,
++					     params.shading.b[y][x] };
++
++			for (unsigned int i = 0; i < 3; i++) {
++				const float n = (c[i] - minGain) / scale * 255.0f;
++				texels[(y * gw + x) * 3 + i] =
++					static_cast<uint8_t>(std::clamp(n, 0.0f, 255.0f));
++			}
++		}
++	}
++
++	if (!lscTexture_) {
++		glGenTextures(1, &lscTexture_);
++		glActiveTexture(GL_TEXTURE7);
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++		/* GL_LINEAR gives the bilinear interpolation between nodes. */
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	} else {
++		glActiveTexture(GL_TEXTURE7);
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++	}
++
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, gw, gh, 0, GL_RGB,
++		     GL_UNSIGNED_BYTE, texels.data());
++
++	glUniform1i(lscUniformDataIn_, 7);
++	glUniform1f(lscScaleUniformDataIn_, scale);
++	glUniform1f(lscOffsetUniformDataIn_, minGain);
++	LOG(Debayer, Debug) << "LSC texture: min gain " << minGain << " scale " << scale
++			    << " uniform locations lsc " << lscUniformDataIn_ << " scale "
++			    << lscScaleUniformDataIn_ << " offset " << lscOffsetUniformDataIn_;
++}
++
+ int DebayerEGL::getShaderVariableLocations(void)
+ {
+ 	attributeVertex_ = glGetAttribLocation(programId_, "vertexIn");
+@@ -121,6 +211,9 @@
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	lscUniformDataIn_ = glGetUniformLocation(programId_, "lsc");
++	lscScaleUniformDataIn_ = glGetUniformLocation(programId_, "lscScale");
++	lscOffsetUniformDataIn_ = glGetUniformLocation(programId_, "lscOffset");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -166,13 +259,21 @@
+ 		break;
+ 	case formats::ABGR8888:
+ 	case formats::XBGR8888:
+-		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++		/* With a denoise pass the swap happens in the final shader. */
++		if (!denoiseEnabled_)
++			egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++		break;
++	case formats::YUYV:
++		/* Packed by the final pass from the RGB intermediate. */
+ 		break;
+ 	default:
+ 		LOG(Debayer, Error) << "Unsupported output format";
+ 		return -EINVAL;
+ 	}
+ 
++	if (lscEnabled_)
++		egl_.pushEnv(shaderEnv, "#define LSC_ENABLED");
++
+ 	/* Pixel location parameters */
+ 	glFormat_ = GL_LUMINANCE;
+ 	bytesPerPixel_ = 1;
+@@ -284,10 +385,358 @@
+ 	return getShaderVariableLocations();
+ }
+ 
++int DebayerEGL::initDenoiseShader(PixelFormat outputFormat)
++{
++	std::vector<std::string> shaderEnv;
++	GLuint vertexShaderId = 0;
++	GLuint fragmentShaderId = 0;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	if (!packEnabled_ &&
++	    (outputFormat == formats::ABGR8888 || outputFormat == formats::XBGR8888))
++		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile denoise vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, denoise_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile denoise fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(denoiseProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking denoise program fail";
++		return -ENODEV;
++	}
++
++	dnAttributeVertex_ = glGetAttribLocation(denoiseProgramId_, "vertexIn");
++	dnAttributeTexture_ = glGetAttribLocation(denoiseProgramId_, "textureIn");
++	dnUniformTex_ = glGetUniformLocation(denoiseProgramId_, "tex_y");
++	dnUniformStep_ = glGetUniformLocation(denoiseProgramId_, "tex_step");
++	dnUniformStrideFactor_ = glGetUniformLocation(denoiseProgramId_, "stride_factor");
++	dnUniformProjMatrix_ = glGetUniformLocation(denoiseProgramId_, "proj_matrix");
++	dnUniformChromaSigma_ = glGetUniformLocation(denoiseProgramId_, "chromaSigma");
++	dnUniformLumaSigma_ = glGetUniformLocation(denoiseProgramId_, "lumaSigma");
++	dnUniformLumaStrength_ = glGetUniformLocation(denoiseProgramId_, "lumaStrength");
++
++	return 0;
++}
++
++int DebayerEGL::initPackShader()
++{
++	std::vector<std::string> shaderEnv;
++	GLuint vertexShaderId = 0;
++	GLuint fragmentShaderId = 0;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++	if (!fullRange_)
++		egl_.pushEnv(shaderEnv, "#define LIMITED_RANGE");
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile pack vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, pack_yuyv_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile pack fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(packProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking pack program fail";
++		return -ENODEV;
++	}
++
++	pkAttributeVertex_ = glGetAttribLocation(packProgramId_, "vertexIn");
++	pkAttributeTexture_ = glGetAttribLocation(packProgramId_, "textureIn");
++	pkUniformTex_ = glGetUniformLocation(packProgramId_, "tex_y");
++	pkUniformStep_ = glGetUniformLocation(packProgramId_, "tex_step");
++	pkUniformStrideFactor_ = glGetUniformLocation(packProgramId_, "stride_factor");
++	pkUniformProjMatrix_ = glGetUniformLocation(packProgramId_, "proj_matrix");
++
++	return 0;
++}
++
++void DebayerEGL::runPackPass(eGLImage &source, eGLImage &eglImageOut)
++{
++	static const GLfloat identity[] = {
++		1, 0, 0, 0,
++		0, 1, 0, 0,
++		0, 0, 1, 0,
++		0, 0, 0, 1
++	};
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++	const GLfloat step[] = { 1.0f / outputSize_.width, 1.0f / outputSize_.height };
++
++	egl_.attachTextureToFBO(eglImageOut);
++	egl_.useProgram(packProgramId_);
++	egl_.activateBindTexture(source);
++
++	glEnableVertexAttribArray(pkAttributeVertex_);
++	glVertexAttribPointer(pkAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(pkAttributeTexture_);
++	glVertexAttribPointer(pkAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniform1i(pkUniformTex_, source.texture_unit_uniform_id_);
++	glUniform2fv(pkUniformStep_, 1, step);
++	glUniform1f(pkUniformStrideFactor_, 1.0f);
++	glUniformMatrix4fv(pkUniformProjMatrix_, 1, GL_FALSE, identity);
++
++	/* One fragment per pair of source pixels. */
++	glViewport(0, 0, outputSize_.width / 2, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++}
++
++int DebayerEGL::initTemporalShader()
++{
++	std::vector<std::string> shaderEnv;
++	GLuint vertexShaderId = 0;
++	GLuint fragmentShaderId = 0;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, temporal_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(temporalProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking temporal program fail";
++		return -ENODEV;
++	}
++
++	tpAttributeVertex_ = glGetAttribLocation(temporalProgramId_, "vertexIn");
++	tpAttributeTexture_ = glGetAttribLocation(temporalProgramId_, "textureIn");
++	tpUniformTex_ = glGetUniformLocation(temporalProgramId_, "tex_y");
++	tpUniformPrev_ = glGetUniformLocation(temporalProgramId_, "tex_prev");
++	tpUniformStep_ = glGetUniformLocation(temporalProgramId_, "tex_step");
++	tpUniformStrideFactor_ = glGetUniformLocation(temporalProgramId_, "stride_factor");
++	tpUniformProjMatrix_ = glGetUniformLocation(temporalProgramId_, "proj_matrix");
++	tpUniformSigma_ = glGetUniformLocation(temporalProgramId_, "sigma");
++	tpUniformStrength_ = glGetUniformLocation(temporalProgramId_, "strength");
++	tpUniformChromaStrength_ = glGetUniformLocation(temporalProgramId_, "chromaStrength");
++	tpUniformLow_ = glGetUniformLocation(temporalProgramId_, "motionLow");
++	tpUniformHigh_ = glGetUniformLocation(temporalProgramId_, "motionHigh");
++
++	return 0;
++}
++
++int DebayerEGL::initCopyShader()
++{
++	std::vector<std::string> shaderEnv;
++	GLuint vertexShaderId = 0;
++	GLuint fragmentShaderId = 0;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile copy vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, copy_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile copy fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(copyProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking copy program fail";
++		return -ENODEV;
++	}
++
++	cpAttributeVertex_ = glGetAttribLocation(copyProgramId_, "vertexIn");
++	cpAttributeTexture_ = glGetAttribLocation(copyProgramId_, "textureIn");
++	cpUniformTex_ = glGetUniformLocation(copyProgramId_, "tex_y");
++	cpUniformStrideFactor_ = glGetUniformLocation(copyProgramId_, "stride_factor");
++	cpUniformProjMatrix_ = glGetUniformLocation(copyProgramId_, "proj_matrix");
++
++	return 0;
++}
++
++/*
++ * Blend the history into  source and render into the other history
++ * texture, which becomes the current output (history_[historyIndex_]).
++ */
++void DebayerEGL::runTemporalPass(eGLImage &source, const DebayerParams &params)
++{
++	static const GLfloat identity[] = {
++		1, 0, 0, 0,
++		0, 1, 0, 0,
++		0, 0, 1, 0,
++		0, 0, 0, 1
++	};
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++	const GLfloat step[] = { 1.0f / outputSize_.width, 1.0f / outputSize_.height };
++
++	eGLImage &prev = *history_[historyIndex_];
++	historyIndex_ ^= 1;
++	eGLImage &target = *history_[historyIndex_];
++
++	/* The target is a render target now, not a sampler input. */
++	glActiveTexture(target.texture_unit_);
++	glBindTexture(GL_TEXTURE_2D, 0);
++	egl_.attachTextureToFBO(target);
++	egl_.useProgram(temporalProgramId_);
++	egl_.activateBindTexture(source);
++	egl_.activateBindTexture(prev);
++
++	glEnableVertexAttribArray(tpAttributeVertex_);
++	glVertexAttribPointer(tpAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(tpAttributeTexture_);
++	glVertexAttribPointer(tpAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniform1i(tpUniformTex_, source.texture_unit_uniform_id_);
++	glUniform1i(tpUniformPrev_, prev.texture_unit_uniform_id_);
++	glUniform2fv(tpUniformStep_, 1, step);
++	glUniform1f(tpUniformStrideFactor_, 1.0f);
++	glUniformMatrix4fv(tpUniformProjMatrix_, 1, GL_FALSE, identity);
++	glUniform1f(tpUniformSigma_, params.denoise.temporalSigma);
++	/* The first frame after start has no history: pass the frame through. */
++	glUniform1f(tpUniformStrength_, historyValid_ ? params.denoise.temporalStrength : 0.0f);
++	glUniform1f(tpUniformChromaStrength_, historyValid_ ? params.denoise.temporalChromaStrength : 0.0f);
++	glUniform1f(tpUniformLow_, params.denoise.temporalLow);
++	glUniform1f(tpUniformHigh_, params.denoise.temporalHigh);
++
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++	historyValid_ = true;
++}
++
++void DebayerEGL::runCopyPass(eGLImage &source, eGLImage &eglImageOut)
++{
++	static const GLfloat identity[] = {
++		1, 0, 0, 0,
++		0, 1, 0, 0,
++		0, 0, 1, 0,
++		0, 0, 0, 1
++	};
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++
++	egl_.attachTextureToFBO(eglImageOut);
++	egl_.useProgram(copyProgramId_);
++	egl_.activateBindTexture(source);
++
++	glEnableVertexAttribArray(cpAttributeVertex_);
++	glVertexAttribPointer(cpAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(cpAttributeTexture_);
++	glVertexAttribPointer(cpAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniform1i(cpUniformTex_, source.texture_unit_uniform_id_);
++	glUniform1f(cpUniformStrideFactor_, 1.0f);
++	glUniformMatrix4fv(cpUniformProjMatrix_, 1, GL_FALSE, identity);
++
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++}
++
++void DebayerEGL::runDenoisePass(eGLImage &eglImageOut, const DebayerParams &params)
++{
++	static const GLfloat identity[] = {
++		1, 0, 0, 0,
++		0, 1, 0, 0,
++		0, 0, 1, 0,
++		0, 0, 0, 1
++	};
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++	const GLfloat step[] = { 1.0f / outputSize_.width, 1.0f / outputSize_.height };
++
++	egl_.attachTextureToFBO(eglImageOut);
++	egl_.useProgram(denoiseProgramId_);
++	egl_.activateBindTexture(*intermediate_);
++
++	glEnableVertexAttribArray(dnAttributeVertex_);
++	glVertexAttribPointer(dnAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(dnAttributeTexture_);
++	glVertexAttribPointer(dnAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniform1i(dnUniformTex_, intermediate_->texture_unit_uniform_id_);
++	glUniform2fv(dnUniformStep_, 1, step);
++	glUniform1f(dnUniformStrideFactor_, 1.0f);
++	glUniformMatrix4fv(dnUniformProjMatrix_, 1, GL_FALSE, identity);
++	glUniform1f(dnUniformChromaSigma_, params.denoise.chromaSigma);
++	glUniform1f(dnUniformLumaSigma_, params.denoise.lumaSigma);
++	glUniform1f(dnUniformLumaStrength_, params.denoise.lumaStrength);
++
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++}
++
+ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  [[maybe_unused]] bool ccmEnabled)
++			  [[maybe_unused]] bool ccmEnabled, bool lscEnabled,
++			  bool denoiseEnabled)
+ {
++	lscEnabled_ = lscEnabled;
++	denoiseEnabled_ = denoiseEnabled;
++
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+ 
+@@ -330,6 +779,9 @@
+ 
+ 	outputPixelFormat_ = outputCfg.pixelFormat;
+ 	outputSize_ = outputCfg.size;
++	packEnabled_ = outputCfg.pixelFormat == formats::YUYV;
++	fullRange_ = !outputCfg.colorSpace ||
++		     outputCfg.colorSpace->range == ColorSpace::Range::Full;
+ 	nativeOutputSize_ = outSizeRange.max;
+ 
+ 	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+@@ -343,7 +795,12 @@
+ 	 * Don't pass x,y from window_ since process() already adjusts for it.
+ 	 * But crop the window to 2/3 of its width and height for speedup.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	/*
++	 * The statistics describe the same centred region the output shows,
++	 * and report their position so the IPA can relate zones to the lens
++	 * shading grid.
++	 */
++	stats_->setWindow(window_);
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+@@ -504,6 +961,9 @@
+ 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
++	if (lscEnabled_)
++		uploadLscTexture(params);
++
+ 	return;
+ }
+ 
+@@ -576,7 +1036,12 @@
+ 			LOG(Debayer, Debug) << "Output cache " << outputBufferCount_ << " exceeded evicted entry";
+ 		}
+ 
+-		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++		/*
++		 * A YUYV buffer is imported as 32 bit pixels of half the width:
++		 * one texel per Y0 U Y1 V word.
++		 */
++		const uint32_t texWidth = packEnabled_ ? outputSize_.width / 2 : outputSize_.width;
++		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(GL_RGBA, texWidth,
+ 									      outputSize_.height, outputConfig_.stride, GL_TEXTURE1, 1));
+ 		eglImageOut = eglImageOutCache_.back().second.get();
+ 
+@@ -604,13 +1069,45 @@
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
+-	egl_.attachTextureToFBO(*eglImageOut);
++	const bool viaIntermediate = denoiseEnabled_ || packEnabled_;
++
++	egl_.attachTextureToFBO(viaIntermediate ? *intermediate_ : *eglImageOut);
++	if (viaIntermediate) {
++		/* The intermediate is the render target now, not a sampler input. */
++		glActiveTexture(intermediate_->texture_unit_);
++		glBindTexture(GL_TEXTURE_2D, 0);
++	}
++	egl_.useProgram(programId_);
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+ 	glViewport(0, 0, width_, height_);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
++	/*
++	 * debayer -> [denoise] -> [temporal] -> [pack | copy]: the last stage
++	 * writes the output. The temporal pass renders into its history, so
++	 * something has to copy (or pack) from there.
++	 */
++	const bool temporal = temporalEnabled_ && (params.denoise.temporalStrength > 0.0f ||
++						   params.denoise.temporalChromaStrength > 0.0f);
++	if (!temporal)
++		historyValid_ = false;
++
++	if (denoiseEnabled_)
++		runDenoisePass((temporal || packEnabled_) ? *intermediate2_ : *eglImageOut, params);
++
++	eGLImage *source = denoiseEnabled_ ? intermediate2_.get() : intermediate_.get();
++	if (temporal) {
++		runTemporalPass(*source, params);
++		source = history_[historyIndex_].get();
++	}
++
++	if (packEnabled_)
++		runPackPass(*source, *eglImageOut);
++	else if (temporal)
++		runCopyPass(*source, *eglImageOut);
++
+ 	GLenum err = glGetError();
+ 	if (err != GL_NO_ERROR) {
+ 		LOG(eGL, Error) << "Drawing scene fail " << err;
+@@ -635,6 +1132,12 @@
+ 	std::optional<MappedFrameBuffer> inMapped;
+ 	std::optional<DmaSyncer> inDmaSyncer;
+ 
++	static const bool staleCheckOn = utils::secure_getenv("LIBCAMERA_SOFTISP_STALECHECK") != nullptr;
++	if (staleCheckOn)
++		staleCheck(input, inputConfig_.stride, width_, height_);
++
++	invalidateInputCache(input);
++
+ 	if (debayerGPU(input, output, params, &inMapped, &inDmaSyncer)) {
+ 		LOG(Debayer, Error) << "debayerGPU failed";
+ 		goto error;
+@@ -688,6 +1191,62 @@
+ 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
+ 		return -EINVAL;
+ 
++	/*
++	 * Intermediate render targets at the output size, so optional passes
++	 * run on no more pixels than the output needs. Texture units: 0 is
++	 * the Bayer input, 1 the output, 2 and 3 the intermediates, 7 the LSC
++	 * grid.
++	 */
++	if (denoiseEnabled_ || packEnabled_) {
++		intermediate_ = std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++							   outputSize_.height,
++							   outputSize_.width * 4,
++							   GL_TEXTURE2, 2);
++		egl_.createOutputTexture2D(*intermediate_);
++	}
++	if (denoiseEnabled_) {
++		intermediate2_ = std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++							    outputSize_.height,
++							    outputSize_.width * 4,
++							    GL_TEXTURE3, 3);
++		egl_.createOutputTexture2D(*intermediate2_);
++	}
++
++	/*
++	 * Temporal denoise keeps the previous output: two textures used
++	 * alternately as history and render target. The IPA switches the pass
++	 * on per frame through the parameters; LIBCAMERA_SOFTISP_NOTEMPORAL
++	 * disables it for comparisons.
++	 */
++	static const bool temporalDisabled = utils::secure_getenv("LIBCAMERA_SOFTISP_NOTEMPORAL") != nullptr;
++	temporalEnabled_ = denoiseEnabled_ && !temporalDisabled;
++	historyValid_ = false;
++	historyIndex_ = 0;
++	if (temporalEnabled_) {
++		for (unsigned int i = 0; i < 2; i++) {
++			history_[i] = std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++								 outputSize_.height,
++								 outputSize_.width * 4,
++								 GL_TEXTURE4 + i, 4 + i);
++			egl_.createOutputTexture2D(*history_[i]);
++		}
++	}
++
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Intermediate setup error " << err;
++		return -ENODEV;
++	}
++
++	if (denoiseEnabled_ && initDenoiseShader(outputPixelFormat_))
++		return -EINVAL;
++
++	if (packEnabled_ && initPackShader())
++		return -EINVAL;
++
++	if (temporalEnabled_ && (initTemporalShader() || initCopyShader()))
++		return -EINVAL;
++
+ 	return 0;
+ }
+ 
+@@ -698,6 +1257,37 @@
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
++
++	intermediate_.reset();
++	intermediate2_.reset();
++	history_[0].reset();
++	history_[1].reset();
++	if (temporalProgramId_) {
++		glDeleteProgram(temporalProgramId_);
++		temporalProgramId_ = 0;
++	}
++	if (copyProgramId_) {
++		glDeleteProgram(copyProgramId_);
++		copyProgramId_ = 0;
++	}
++	if (denoiseProgramId_) {
++		glDeleteProgram(denoiseProgramId_);
++		denoiseProgramId_ = 0;
++	}
++	if (packProgramId_) {
++		glDeleteProgram(packProgramId_);
++		packProgramId_ = 0;
++	}
++
++	/*
++	 * start() creates a fresh EGL context, in which a texture name from
++	 * the previous one is meaningless: the shading grid would silently
++	 * stop being applied after a reconfiguration.
++	 */
++	if (lscTexture_) {
++		glDeleteTextures(1, &lscTexture_);
++		lscTexture_ = 0;
++	}
+ }
+ 
+ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer_egl.h libcamera-work/src/libcamera/software_isp/debayer_egl.h
+--- srpm/src/src/libcamera/software_isp/debayer_egl.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer_egl.h	2026-10-29 08:44:25.145687896 -0400
+@@ -45,7 +45,8 @@
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled, bool lscEnabled,
++		      bool denoiseEnabled) override;
+ 
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 
+@@ -65,6 +66,10 @@
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
++	int initDenoiseShader(PixelFormat outputFormat);
++	void runDenoisePass(eGLImage &eglImageOut, const DebayerParams &params);
++	int initPackShader();
++	void runPackPass(eGLImage &source, eGLImage &eglImageOut);
+ 	int getShaderVariableLocations();
+ 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+ 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
+@@ -110,6 +115,80 @@
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
++	GLint lscUniformDataIn_;
++	GLint lscScaleUniformDataIn_;
++	GLint lscOffsetUniformDataIn_;
++
++	/* Lens shading gain grid, uploaded as a small 8 bit texture. */
++	bool lscEnabled_ = false;
++	GLuint lscTexture_ = 0;
++	void uploadLscTexture(const DebayerParams &params);
++
++	/*
++	 * Optional second pass: the debayer renders into an intermediate texture
++	 * at the output size and the denoise shader writes the final buffer.
++	 */
++	bool denoiseEnabled_ = false;
++	GLuint denoiseProgramId_ = 0;
++	std::unique_ptr<eGLImage> intermediate_;
++
++	/*
++	 * YUYV output: a final pass packs the processed RGB frame (from
++	 * intermediate_, or intermediate2_ after denoising) into the buffer.
++	 */
++	bool packEnabled_ = false;
++	bool fullRange_ = true;
++	GLuint packProgramId_ = 0;
++	std::unique_ptr<eGLImage> intermediate2_;
++	GLint pkAttributeVertex_;
++	GLint pkAttributeTexture_;
++	GLint pkUniformTex_;
++	GLint pkUniformStep_;
++	GLint pkUniformStrideFactor_;
++	GLint pkUniformProjMatrix_;
++	GLint dnAttributeVertex_;
++	GLint dnAttributeTexture_;
++	GLint dnUniformTex_;
++	GLint dnUniformStep_;
++	GLint dnUniformStrideFactor_;
++	GLint dnUniformProjMatrix_;
++	GLint dnUniformChromaSigma_;
++	GLint dnUniformLumaSigma_;
++	GLint dnUniformLumaStrength_;
++
++	/*
++	 * Temporal denoise: the pass blends the previous output (history) into
++	 * the current frame and renders into the other history texture, which
++	 * the pack or copy pass then writes to the output buffer. Texture
++	 * units 4 and 5.
++	 */
++	int initTemporalShader();
++	int initCopyShader();
++	void runTemporalPass(eGLImage &source, const DebayerParams &params);
++	void runCopyPass(eGLImage &source, eGLImage &eglImageOut);
++	bool temporalEnabled_ = false;
++	bool historyValid_ = false;
++	unsigned int historyIndex_ = 0;
++	std::unique_ptr<eGLImage> history_[2];
++	GLuint temporalProgramId_ = 0;
++	GLint tpAttributeVertex_;
++	GLint tpAttributeTexture_;
++	GLint tpUniformTex_;
++	GLint tpUniformPrev_;
++	GLint tpUniformStep_;
++	GLint tpUniformStrideFactor_;
++	GLint tpUniformProjMatrix_;
++	GLint tpUniformSigma_;
++	GLint tpUniformStrength_;
++	GLint tpUniformChromaStrength_;
++	GLint tpUniformLow_;
++	GLint tpUniformHigh_;
++	GLuint copyProgramId_ = 0;
++	GLint cpAttributeVertex_;
++	GLint cpAttributeTexture_;
++	GLint cpUniformTex_;
++	GLint cpUniformStrideFactor_;
++	GLint cpUniformProjMatrix_;
+ 
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/debayer.h libcamera-work/src/libcamera/software_isp/debayer.h
+--- srpm/src/src/libcamera/software_isp/debayer.h	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/debayer.h	2026-10-28 15:54:08.005653339 -0400
+@@ -14,6 +14,9 @@
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++
++#include <map>
++#include <memory>
+ #include <libcamera/base/object.h>
+ #include <libcamera/base/signal.h>
+ 
+@@ -27,6 +30,8 @@
+ 
+ namespace libcamera {
+ 
++class MappedFrameBuffer;
++
+ class CameraManager;
+ class FrameBuffer;
+ 
+@@ -40,7 +45,8 @@
+ 
+ 	virtual int configure(const StreamConfiguration &inputCfg,
+ 			      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			      bool ccmEnabled) = 0;
++			      bool ccmEnabled, bool lscEnabled,
++			      bool denoiseEnabled) = 0;
+ 
+ 	virtual std::vector<PixelFormat> formats(PixelFormat inputFormat) = 0;
+ 
+@@ -49,6 +55,19 @@
+ 	virtual uint32_t preferredInputStride([[maybe_unused]] const PixelFormat &inputFormat, [[maybe_unused]] const Size &size) { return 0; }
+ 
+ 	virtual void process(uint32_t frame, FrameBuffer *input, FrameBuffer *output, const DebayerParams &params) = 0;
++
++	/*
++	 * Make the CPU caches coherent with the capture DMA for an input
++	 * buffer. The IPU7 ISYS writes buffers without snooping the CPU
++	 * caches and its driver flushes them only when a buffer is first
++	 * mapped, so cache lines left from the last use of the same buffer
++	 * (by the statistics code, a CPU debayer, or the GPU through the
++	 * shared last level cache) are stale: they show up as 64 byte chunks
++	 * of an old frame.
++	 */
++	void invalidateInputCache(FrameBuffer *input);
++	void flushInputCache(FrameBuffer *input);
++	void staleCheck(FrameBuffer *input, unsigned int stride, unsigned int width, unsigned int height);
+ 	virtual int start() { return 0; }
+ 	virtual void stop() {}
+ 
+@@ -83,6 +102,10 @@
+ 	Benchmark bench_;
+ 
+ private:
++	std::map<int, std::unique_ptr<MappedFrameBuffer>> inputMaps_;
++	std::map<int, std::vector<uint8_t>> staleCopies_;
++
++private:
+ 	virtual Size patternSize(PixelFormat inputFormat) = 0;
+ 
+ protected:
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/software_isp.cpp libcamera-work/src/libcamera/software_isp/software_isp.cpp
+--- srpm/src/src/libcamera/software_isp/software_isp.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/software_isp.cpp	2026-10-28 13:29:42.209435458 -0400
+@@ -163,7 +163,7 @@
+ 			 sensorInfo,
+ 			 sensor->controls(),
+ 			 ipaControls,
+-			 &ccmEnabled_);
++			 &ccmEnabled_, &lscEnabled_, &denoiseEnabled_);
+ 	if (ret) {
+ 		LOG(SoftwareIsp, Error) << "IPA init failed";
+ 		debayer_.reset();
+@@ -292,7 +292,8 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_);
++	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_, lscEnabled_,
++				    denoiseEnabled_);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x build srpm/src/src/libcamera/software_isp/swstats_cpu.cpp libcamera-work/src/libcamera/software_isp/swstats_cpu.cpp
+--- srpm/src/src/libcamera/software_isp/swstats_cpu.cpp	2026-07-10 06:12:38.000000000 -0400
++++ libcamera-work/src/libcamera/software_isp/swstats_cpu.cpp	2026-10-28 14:35:18.540557996 -0400
+@@ -174,12 +174,15 @@
+ #define SWSTATS_START_LINE_STATS(pixel_t) \
+ 	pixel_t r, g, g2, b;              \
+ 	uint64_t yVal;                    \
++	unsigned int yBin;                \
++	unsigned int zone;                \
++	const unsigned int zoneBase = stats.zoneRow * SwIspStats::kZoneCols; \
+                                           \
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+ 	uint64_t sumB = 0;
+ 
+-#define SWSTATS_ACCUMULATE_LINE_STATS(div) \
++#define SWSTATS_ACCUMULATE_LINE_STATS(div, lineWidth) \
+ 	sumR += r;                         \
+ 	sumG += g;                         \
+ 	sumB += b;                         \
+@@ -187,7 +190,14 @@
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+ 	yVal += b * kBlueYMul;             \
+-	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++	yBin = yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div)); \
++	stats.yHistogram[yBin]++;          \
++	zone = zoneBase + x * SwIspStats::kZoneCols / (lineWidth); \
++	yBin = yBin * SwIspStats::kLumaBands / SwIspStats::kYHistogramSize; \
++	stats.zoneSum_[zone][yBin].r() += r; \
++	stats.zoneSum_[zone][yBin].g() += g; \
++	stats.zoneSum_[zone][yBin].b() += b; \
++	stats.zoneCount_[zone][yBin]++;
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+@@ -213,7 +223,7 @@
+ 
+ 		g = (g + g2) / 2;
+ 
+-		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_LINE_STATS(1, window_.width)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -239,7 +249,7 @@
+ 		g = (g + g2) / 2;
+ 
+ 		/* divide Y by 4 for 10 -> 8 bpp value */
+-		SWSTATS_ACCUMULATE_LINE_STATS(4)
++		SWSTATS_ACCUMULATE_LINE_STATS(4, window_.width)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -265,7 +275,7 @@
+ 		g = (g + g2) / 2;
+ 
+ 		/* divide Y by 16 for 12 -> 8 bpp value */
+-		SWSTATS_ACCUMULATE_LINE_STATS(16)
++		SWSTATS_ACCUMULATE_LINE_STATS(16, window_.width)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -291,7 +301,7 @@
+ 		r = src1[x + 1];
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+-		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_LINE_STATS(1, widthInBytes)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -317,7 +327,7 @@
+ 		g2 = src1[x + 1];
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+-		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_LINE_STATS(1, widthInBytes)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -343,7 +353,7 @@
+ 
+ 		g = (g + g2) / 2;
+ 
+-		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_LINE_STATS(1, widthInBytes)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -369,7 +379,7 @@
+ 
+ 		g = (g + g2) / 2;
+ 
+-		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_LINE_STATS(1, widthInBytes)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -392,6 +402,12 @@
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.yHistogram.fill(0);
++		for (auto &zs : s.zoneSum_)
++			for (auto &bs : zs)
++				bs = RGB<uint64_t>({ 0, 0, 0 });
++		for (auto &zc : s.zoneCount_)
++			for (auto &c : zc)
++				c = 0;
+ 	}
+ }
+ 
+@@ -409,13 +425,32 @@
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->yHistogram.fill(0);
++		for (auto &zs : sharedStats_->zoneSum_)
++			for (auto &bs : zs)
++				bs = RGB<uint64_t>({ 0, 0, 0 });
++		for (auto &zc : sharedStats_->zoneCount_)
++			for (auto &c : zc)
++				c = 0;
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
++			for (unsigned int z = 0; z < SwIspStats::kZoneRows * SwIspStats::kZoneCols; z++) {
++				for (unsigned int b = 0; b < SwIspStats::kLumaBands; b++) {
++					sharedStats_->zoneSum_[z][b] += s.zoneSum_[z][b];
++					sharedStats_->zoneCount_[z][b] += s.zoneCount_[z][b];
++				}
++			}
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		for (auto &zs : sharedStats_->zoneSum_)
++			for (auto &bs : zs)
++				bs >>= sumShift_;
++		sharedStats_->windowX = window_.x;
++		sharedStats_->windowY = window_.y;
++		sharedStats_->windowWidth = window_.width;
++		sharedStats_->windowHeight = window_.height;
+ 	}
+ 
+ 	sharedStats_->valid = valid;

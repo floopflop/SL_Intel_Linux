@@ -1,0 +1,142 @@
+From 52fb7d07a0aaa2c8d4ccf86e0da3eb5f6ecc11a7 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Wed, 28 Oct 2026 10:17:16 -0400
+Subject: [PATCH 5/8] daemon: add [Touchpad] MultiFingerMotionScale
+ (scroll/gesture speed)
+
+---
+ src/apps/daemon/touch.hpp        | 46 ++++++++++++++++++++++++++++++++
+ src/core/generic/config.hpp      |  1 +
+ src/core/linux/config-loader.hpp |  1 +
+ 3 files changed, 48 insertions(+)
+
+diff --git a/src/apps/daemon/touch.hpp b/src/apps/daemon/touch.hpp
+index 399a719..35159d2 100644
+--- a/src/apps/daemon/touch.hpp
++++ b/src/apps/daemon/touch.hpp
+@@ -88,6 +88,18 @@ private:
+ 	// taps (a blink during a two-finger scroll reads as a two-finger tap).
+ 	f64 m_lift_grace_ms = 0;
+ 
++	// Motion scale applied while two or more fingers are down (scroll, pinch,
++	// swipe). libinput derives scroll distance from finger travel with no speed
++	// setting of its own, so this is where scroll speed can be adjusted. Each
++	// contact keeps a persistent offset so its reported position stays
++	// continuous when the finger count changes; no pointer jumps.
++	f64 m_multi_finger_motion_scale = 1.0;
++	struct MotionScale {
++		Vector2<f64> last;
++		Vector2<f64> offset = Vector2<f64>::Zero();
++	};
++	std::map<usize, MotionScale> m_mscale {};
++
+ 	// Exponential position smoothing factor in (0, 1]; 0 or 1 disables it.
+ 	f64 m_position_smoothing = 0;
+ 	std::map<usize, Vector2<f64>> m_smoothed {};
+@@ -155,6 +167,7 @@ public:
+ 		if (info.is_touchpad()) {
+ 			m_lift_grace_ms = config.touchpad_lift_grace_ms;
+ 			m_position_smoothing = config.touchpad_position_smoothing;
++			m_multi_finger_motion_scale = config.touchpad_multi_finger_motion_scale;
+ 		}
+ 
+ 		const f64 diag = std::hypot(config.width, config.height);
+@@ -202,6 +215,7 @@ public:
+ 			this->lift_all();
+ 			m_smoothed.clear();
+ 			m_motion.clear();
++			m_mscale.clear();
+ 		} else {
+ 			this->process(contacts);
+ 		}
+@@ -265,6 +279,7 @@ public:
+ 		m_lift.clear();
+ 		m_smoothed.clear();
+ 		m_motion.clear();
++		m_mscale.clear();
+ 		m_blocked = false;
+ 	}
+ 
+@@ -408,10 +423,12 @@ private:
+ 			contacts::Contact<f64> smoothed = contact;
+ 			if (!lift) {
+ 				smoothed.mean = this->smooth(index, contact.mean);
++				smoothed.mean = this->scale_motion(index, smoothed.mean);
+ 				this->record_motion(index, smoothed);
+ 			} else {
+ 				m_smoothed.erase(index);
+ 				m_motion.erase(index);
++				m_mscale.erase(index);
+ 			}
+ 
+ 			if (!lift)
+@@ -433,6 +450,7 @@ private:
+ 			this->lift_multitouch(index);
+ 			m_smoothed.erase(index);
+ 			m_motion.erase(index);
++			m_mscale.erase(index);
+ 		}
+ 
+ 		// Contacts held by the lift grace period: continue them along their last
+@@ -504,6 +522,34 @@ private:
+ 		return it->second;
+ 	}
+ 
++	/*!
++	 * Scales a contact's motion while two or more fingers are down. The scaled
++	 * motion is accumulated into a per-contact offset, so the reported position
++	 * is continuous across changes of the finger count and the offset simply
++	 * persists until the contact lifts.
++	 */
++	Vector2<f64> scale_motion(const usize index, const Vector2<f64> &mean)
++	{
++		auto it = m_mscale.find(index);
++		if (it == m_mscale.end()) {
++			m_mscale[index] = MotionScale {mean, Vector2<f64>::Zero()};
++			return mean;
++		}
++
++		MotionScale &m = it->second;
++		const Vector2<f64> delta = mean - m.last;
++		m.last = mean;
++
++		if (m_current.size() >= 2 && m_multi_finger_motion_scale > 0 &&
++		    m_multi_finger_motion_scale < 1)
++			m.offset += delta * (m_multi_finger_motion_scale - 1);
++
++		Vector2<f64> out = mean + m.offset;
++		out.x() = std::clamp(out.x(), 0.0, 1.0);
++		out.y() = std::clamp(out.y(), 0.0, 1.0);
++		return out;
++	}
++
+ 	/*!
+ 	 * Remembers the emitted sample of a contact and updates its velocity estimate.
+ 	 */
+diff --git a/src/core/generic/config.hpp b/src/core/generic/config.hpp
+index 6eff939..ae69e5a 100644
+--- a/src/core/generic/config.hpp
++++ b/src/core/generic/config.hpp
+@@ -37,6 +37,7 @@ public:
+ 	f64 touchpad_button_debounce_ms = 25;
+ 	f64 touchpad_lift_grace_ms = 0;
+ 	f64 touchpad_position_smoothing = 0;
++	f64 touchpad_multi_finger_motion_scale = 1.0;
+ 
+ 	// [Contacts]
+ 	std::string contacts_neutral = "mode";
+diff --git a/src/core/linux/config-loader.hpp b/src/core/linux/config-loader.hpp
+index 214ea95..0e13a05 100644
+--- a/src/core/linux/config-loader.hpp
++++ b/src/core/linux/config-loader.hpp
+@@ -163,6 +163,7 @@ private:
+ 		this->get(ini, "Touchpad", "ButtonDebounceMs", m_config.touchpad_button_debounce_ms);
+ 		this->get(ini, "Touchpad", "LiftGraceMs", m_config.touchpad_lift_grace_ms);
+ 		this->get(ini, "Touchpad", "PositionSmoothing", m_config.touchpad_position_smoothing);
++		this->get(ini, "Touchpad", "MultiFingerMotionScale", m_config.touchpad_multi_finger_motion_scale);
+ 
+ 		this->get(ini, "Contacts", "Neutral", m_config.contacts_neutral);
+ 		this->get(ini, "Contacts", "NeutralValue", m_config.contacts_neutral_value);
+-- 
+2.56.0
+

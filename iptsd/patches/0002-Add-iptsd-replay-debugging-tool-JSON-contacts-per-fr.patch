@@ -1,0 +1,123 @@
+From 686b93aa7f7295853bb0eb3a928d78cc677c31d8 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Mon, 26 Oct 2026 20:53:17 -0400
+Subject: [PATCH 2/8] Add iptsd-replay debugging tool (JSON contacts per frame
+ from a dump)
+
+---
+ src/apps/replay/main.cpp | 80 ++++++++++++++++++++++++++++++++++++++++
+ src/meson.build          | 11 ++++++
+ 2 files changed, 91 insertions(+)
+ create mode 100644 src/apps/replay/main.cpp
+
+diff --git a/src/apps/replay/main.cpp b/src/apps/replay/main.cpp
+new file mode 100644
+index 0000000..14e56c7
+--- /dev/null
++++ b/src/apps/replay/main.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// iptsd-replay: run a raw dump through the contact pipeline and print one JSON line per frame.
++// Config can be overridden with IPTSD_CONFIG_FILE=<file>.
++
++#include <common/types.hpp>
++#include <contacts/contact.hpp>
++#include <core/generic/application.hpp>
++#include <core/generic/config.hpp>
++#include <core/linux/device/file.hpp>
++#include <core/linux/runner.hpp>
++
++#include <CLI/CLI.hpp>
++#include <gsl/gsl>
++#include <spdlog/spdlog.h>
++
++#include <cstdio>
++#include <exception>
++#include <filesystem>
++#include <vector>
++
++namespace iptsd::apps::replay {
++
++class Replay : public core::Application {
++private:
++	usize m_frame = 0;
++
++public:
++	Replay(const core::Config &config, const core::DeviceInfo &info)
++		: core::Application(config, info)
++	{
++		std::printf("{\"meta\":{\"width\":%.2f,\"height\":%.2f,\"rows\":%u,\"cols\":%u,"
++			    "\"athresh\":%.1f,\"dthresh\":%.1f,\"neutral\":\"%s\",\"nvalue\":%.1f}}\n",
++			    config.width, config.height,
++			    info.meta ? info.meta->rows : 0u, info.meta ? info.meta->columns : 0u,
++			    config.contacts_activation_threshold, config.contacts_deactivation_threshold,
++			    config.contacts_neutral.c_str(), config.contacts_neutral_value);
++	}
++
++	void on_touch(const std::vector<contacts::Contact<f64>> &contacts) override
++	{
++		std::printf("{\"f\":%zu,\"c\":[", m_frame++);
++		bool first = true;
++		for (const auto &c : contacts) {
++			std::printf("%s{\"i\":%ld,\"x\":%.4f,\"y\":%.4f,\"maj\":%.4f,\"min\":%.4f,\"o\":%.3f,\"v\":%d,\"s\":%d}",
++				    first ? "" : ",",
++				    c.index ? static_cast<long>(*c.index) : -1L,
++				    c.mean.x(), c.mean.y(), c.size.maxCoeff(), c.size.minCoeff(),
++				    c.orientation, c.valid.value_or(true) ? 1 : 0, c.stable.value_or(true) ? 1 : 0);
++			first = false;
++		}
++		std::printf("]}\n");
++	}
++};
++
++namespace {
++int run(const int argc, const char **argv)
++{
++	CLI::App app {"Replay a raw iptsd dump and print detected contacts as JSON lines"};
++	std::filesystem::path path {};
++	app.add_option("DATA", path)->description("Binary dump from iptsd-dump")->type_name("FILE")->required();
++	CLI11_PARSE(app, argc, argv);
++
++	core::linux::Runner<Replay, core::linux::device::File> replay {path};
++	replay.run();
++	return 0;
++}
++} // namespace
++} // namespace iptsd::apps::replay
++
++int main(const int argc, const char **argv)
++{
++	spdlog::set_pattern("[%X.%e] [%^%l%$] %v");
++	spdlog::set_level(spdlog::level::warn);
++	try {
++		return iptsd::apps::replay::run(argc, argv);
++	} catch (const std::exception &e) {
++		spdlog::error(e.what());
++		return EXIT_FAILURE;
++	}
++}
+diff --git a/src/meson.build b/src/meson.build
+index 07c92c0..fb02510 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -162,6 +162,17 @@ if tools.contains('perf')
+ 	)
+ endif
+ 
++if tools.contains('perf')
++	executable(
++		'iptsd-replay',
++		'apps/replay/main.cpp',
++		install: false,
++		cpp_args: optflags,
++		dependencies: default_deps,
++		include_directories: includes,
++	)
++endif
++
+ if tools.contains('plot') or tools.contains('show')
+ 	cairo = dependency('cairomm-1.0', required: false)
+ endif
+-- 
+2.56.0
+

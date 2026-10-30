@@ -1,0 +1,142 @@
+From 47bc35947749a733b3708b1ebff7f8ba3c725fe8 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Mon, 26 Oct 2026 21:17:11 -0400
+Subject: [PATCH 4/8] daemon: keep grace-held contacts moving at their last
+ velocity instead of freezing them
+
+---
+ src/apps/daemon/touch.hpp | 72 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/src/apps/daemon/touch.hpp b/src/apps/daemon/touch.hpp
+index c90e626..399a719 100644
+--- a/src/apps/daemon/touch.hpp
++++ b/src/apps/daemon/touch.hpp
+@@ -92,6 +92,17 @@ private:
+ 	f64 m_position_smoothing = 0;
+ 	std::map<usize, Vector2<f64>> m_smoothed {};
+ 
++	// Last emitted sample per contact index, used to keep a contact that is being
++	// held by the lift grace period moving at its last velocity instead of freezing.
++	// A frozen tail reads as "fingers stopped" to libinput and kills flick momentum.
++	struct Motion {
++		contacts::Contact<f64> contact;
++		Vector2<f64> velocity = Vector2<f64>::Zero();  // normalized units per second
++		std::chrono::steady_clock::time_point time;
++	};
++	std::map<usize, Motion> m_motion {};
++	std::chrono::steady_clock::time_point m_now {};
++
+ 	// When each active contact index was last actually detected.
+ 	std::map<usize, std::chrono::steady_clock::time_point> m_last_seen {};
+ 
+@@ -177,6 +188,8 @@ public:
+ 		if (!m_enabled)
+ 			return;
+ 
++		m_now = std::chrono::steady_clock::now();
++
+ 		// Find the inputs that need to be lifted
+ 		this->search_lifted(contacts);
+ 
+@@ -185,10 +198,13 @@ public:
+ 
+ 		m_blocked = this->is_blocked(contacts);
+ 
+-		if (m_blocked)
++		if (m_blocked) {
+ 			this->lift_all();
+-		else
++			m_smoothed.clear();
++			m_motion.clear();
++		} else {
+ 			this->process(contacts);
++		}
+ 
+ 		this->sync();
+ 	}
+@@ -248,6 +264,7 @@ public:
+ 		m_last.clear();
+ 		m_lift.clear();
+ 		m_smoothed.clear();
++		m_motion.clear();
+ 		m_blocked = false;
+ 	}
+ 
+@@ -389,10 +406,13 @@ private:
+ 			lift |= contact.mean.y() < -oy || contact.mean.y() > (oy + 1);
+ 
+ 			contacts::Contact<f64> smoothed = contact;
+-			if (!lift)
++			if (!lift) {
+ 				smoothed.mean = this->smooth(index, contact.mean);
+-			else
++				this->record_motion(index, smoothed);
++			} else {
+ 				m_smoothed.erase(index);
++				m_motion.erase(index);
++			}
+ 
+ 			if (!lift)
+ 				this->emit_multitouch(smoothed);
+@@ -412,6 +432,28 @@ private:
+ 		for (const usize &index : m_lift) {
+ 			this->lift_multitouch(index);
+ 			m_smoothed.erase(index);
++			m_motion.erase(index);
++		}
++
++		// Contacts held by the lift grace period: continue them along their last
++		// velocity so a lift mid-motion does not look like a stop followed by a lift.
++		for (const usize &index : m_current) {
++			if (contacts::Contact<f64>::find_in_frame(index, contacts).has_value())
++				continue;
++
++			const auto it = m_motion.find(index);
++			if (it == m_motion.end())
++				continue;
++
++			contacts::Contact<f64> held = it->second.contact;
++			const f64 dt = std::chrono::duration<f64>(m_now - it->second.time).count();
++			held.mean = it->second.contact.mean + it->second.velocity * std::clamp(dt, 0.0, 0.2);
++			this->emit_multitouch(held);
++
++			if (index == m_single_index) {
++				this->emit_singletouch(held);
++				reset_singletouch = false;
++			}
+ 		}
+ 
+ 		if (reset_singletouch && m_current.find(m_single_index) != m_current.cend()) {
+@@ -462,6 +504,28 @@ private:
+ 		return it->second;
+ 	}
+ 
++	/*!
++	 * Remembers the emitted sample of a contact and updates its velocity estimate.
++	 */
++	void record_motion(const usize index, const contacts::Contact<f64> &contact)
++	{
++		auto it = m_motion.find(index);
++		if (it == m_motion.end()) {
++			m_motion[index] = Motion {contact, Vector2<f64>::Zero(), m_now};
++			return;
++		}
++
++		Motion &m = it->second;
++		const f64 dt = std::chrono::duration<f64>(m_now - m.time).count();
++		if (dt > 0) {
++			const Vector2<f64> v = (contact.mean - m.contact.mean) / dt;
++			// Light low-pass so one noisy frame does not define the flick velocity.
++			m.velocity = 0.5 * m.velocity + 0.5 * v;
++		}
++		m.contact = contact;
++		m.time = m_now;
++	}
++
+ 	/*!
+ 	 * Emits a lift event using the linux multitouch protocol.
+ 	 */
+-- 
+2.56.0
+

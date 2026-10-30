@@ -1,0 +1,541 @@
+From 160202622d288cf18ed4d5e19d0bd59466bee016 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Mon, 26 Oct 2026 21:08:10 -0400
+Subject: [PATCH 3/8] tracker: remember lost contacts for LiftGraceMs
+ (re-attach blinks, no index collisions); daemon: optional PositionSmoothing;
+ replay: frame-based time
+
+---
+ src/apps/daemon/touch.hpp         |  42 ++++++++++--
+ src/apps/replay/main.cpp          |  41 +++++++++++-
+ src/contacts/config.hpp           |   2 +
+ src/contacts/finder.hpp           |   8 ++-
+ src/contacts/tracking/config.hpp  |  42 ++++++++++++
+ src/contacts/tracking/tracker.hpp | 108 +++++++++++++++++++++---------
+ src/core/generic/application.hpp  |  13 +++-
+ src/core/generic/config.hpp       |   4 ++
+ src/core/linux/config-loader.hpp  |   1 +
+ 9 files changed, 219 insertions(+), 42 deletions(-)
+ create mode 100644 src/contacts/tracking/config.hpp
+
+diff --git a/src/apps/daemon/touch.hpp b/src/apps/daemon/touch.hpp
+index a76da7b..c90e626 100644
+--- a/src/apps/daemon/touch.hpp
++++ b/src/apps/daemon/touch.hpp
+@@ -88,6 +88,10 @@ private:
+ 	// taps (a blink during a two-finger scroll reads as a two-finger tap).
+ 	f64 m_lift_grace_ms = 0;
+ 
++	// Exponential position smoothing factor in (0, 1]; 0 or 1 disables it.
++	f64 m_position_smoothing = 0;
++	std::map<usize, Vector2<f64>> m_smoothed {};
++
+ 	// When each active contact index was last actually detected.
+ 	std::map<usize, std::chrono::steady_clock::time_point> m_last_seen {};
+ 
+@@ -137,8 +141,10 @@ public:
+ 
+ 		m_button_debounce_ms = config.touchpad_button_debounce_ms;
+ 
+-		if (info.is_touchpad())
++		if (info.is_touchpad()) {
+ 			m_lift_grace_ms = config.touchpad_lift_grace_ms;
++			m_position_smoothing = config.touchpad_position_smoothing;
++		}
+ 
+ 		const f64 diag = std::hypot(config.width, config.height);
+ 
+@@ -241,6 +247,7 @@ public:
+ 		m_current.clear();
+ 		m_last.clear();
+ 		m_lift.clear();
++		m_smoothed.clear();
+ 		m_blocked = false;
+ 	}
+ 
+@@ -381,8 +388,14 @@ private:
+ 			lift |= contact.mean.x() < -ox || contact.mean.x() > (ox + 1);
+ 			lift |= contact.mean.y() < -oy || contact.mean.y() > (oy + 1);
+ 
++			contacts::Contact<f64> smoothed = contact;
++			if (!lift)
++				smoothed.mean = this->smooth(index, contact.mean);
++			else
++				m_smoothed.erase(index);
++
+ 			if (!lift)
+-				this->emit_multitouch(contact);
++				this->emit_multitouch(smoothed);
+ 			else
+ 				this->lift_multitouch(index);
+ 
+@@ -391,13 +404,15 @@ private:
+ 				continue;
+ 
+ 			if (!lift) {
+-				this->emit_singletouch(contact);
++				this->emit_singletouch(smoothed);
+ 				reset_singletouch = false;
+ 			}
+ 		}
+ 
+-		for (const usize &index : m_lift)
++		for (const usize &index : m_lift) {
+ 			this->lift_multitouch(index);
++			m_smoothed.erase(index);
++		}
+ 
+ 		if (reset_singletouch && m_current.find(m_single_index) != m_current.cend()) {
+ 			// The singletouch contact is only being held by the lift grace
+@@ -428,6 +443,25 @@ private:
+ 		}
+ 	}
+ 
++	/*!
++	 * Applies exponential smoothing to a contact position. The first sample of a
++	 * contact is passed through unchanged so touch-down position is exact.
++	 */
++	Vector2<f64> smooth(const usize index, const Vector2<f64> &mean)
++	{
++		if (m_position_smoothing <= 0 || m_position_smoothing >= 1)
++			return mean;
++
++		const auto it = m_smoothed.find(index);
++		if (it == m_smoothed.end()) {
++			m_smoothed[index] = mean;
++			return mean;
++		}
++
++		it->second += m_position_smoothing * (mean - it->second);
++		return it->second;
++	}
++
+ 	/*!
+ 	 * Emits a lift event using the linux multitouch protocol.
+ 	 */
+diff --git a/src/apps/replay/main.cpp b/src/apps/replay/main.cpp
+index 14e56c7..1f9e692 100644
+--- a/src/apps/replay/main.cpp
++++ b/src/apps/replay/main.cpp
+@@ -14,6 +14,10 @@
+ #include <spdlog/spdlog.h>
+ 
+ #include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <string>
++#include <ipts/samples/touch.hpp>
+ #include <exception>
+ #include <filesystem>
+ #include <vector>
+@@ -23,11 +27,36 @@ namespace iptsd::apps::replay {
+ class Replay : public core::Application {
+ private:
+ 	usize m_frame = 0;
++	usize m_raw_frame = 0;
++	std::function<void(const ipts::samples::Touch &)> m_orig_touch {};
++	bool m_dump_heatmap = std::getenv("IPTSD_REPLAY_HEATMAP") != nullptr;
++
++	// per-frame raw info captured before processing
++	u8 m_min = 0, m_max = 0, m_rows = 0, m_cols = 0;
++	std::string m_hex {};
++	u32 m_raw_mode = 0, m_raw_lo = 0, m_raw_hi = 0;
+ 
+ public:
+ 	Replay(const core::Config &config, const core::DeviceInfo &info)
+ 		: core::Application(config, info)
+ 	{
++		m_orig_touch = m_parser.on_touch;
++		m_parser.on_touch = [&](const ipts::samples::Touch &t) {
++			m_raw_frame++;
++			m_min = t.min; m_max = t.max; m_rows = t.rows; m_cols = t.columns;
++			u32 hist[256] = {};
++			m_raw_lo = 255; m_raw_hi = 0;
++			m_hex.clear();
++			static const char *hx = "0123456789abcdef";
++			for (const u8 v : t.heatmap) {
++				hist[v]++;
++				m_raw_lo = std::min<u32>(m_raw_lo, v); m_raw_hi = std::max<u32>(m_raw_hi, v);
++				if (m_dump_heatmap) { m_hex.push_back(hx[v >> 4]); m_hex.push_back(hx[v & 15]); }
++			}
++			u32 best = 0; m_raw_mode = 0;
++			for (u32 i = 0; i < 256; i++) if (hist[i] > best) { best = hist[i]; m_raw_mode = i; }
++			if (m_orig_touch) m_orig_touch(t);
++		};
+ 		std::printf("{\"meta\":{\"width\":%.2f,\"height\":%.2f,\"rows\":%u,\"cols\":%u,"
+ 			    "\"athresh\":%.1f,\"dthresh\":%.1f,\"neutral\":\"%s\",\"nvalue\":%.1f}}\n",
+ 			    config.width, config.height,
+@@ -36,9 +65,19 @@ public:
+ 			    config.contacts_neutral.c_str(), config.contacts_neutral_value);
+ 	}
+ 
++	// Sensor runs at ~120 Hz on the SL7; replay time advances 8.33 ms per frame.
++	f64 frame_time_ms() override
++	{
++		return static_cast<f64>(m_raw_frame) * (1000.0 / 120.0);
++	}
++
+ 	void on_touch(const std::vector<contacts::Contact<f64>> &contacts) override
+ 	{
+-		std::printf("{\"f\":%zu,\"c\":[", m_frame++);
++		std::printf("{\"f\":%zu,\"hdr\":[%u,%u,%u,%u],\"raw\":[%u,%u,%u]", m_frame++,
++			    m_rows, m_cols, m_min, m_max, m_raw_lo, m_raw_mode, m_raw_hi);
++		if (m_dump_heatmap)
++			std::printf(",\"h\":\"%s\"", m_hex.c_str());
++		std::printf(",\"c\":[");
+ 		bool first = true;
+ 		for (const auto &c : contacts) {
+ 			std::printf("%s{\"i\":%ld,\"x\":%.4f,\"y\":%.4f,\"maj\":%.4f,\"min\":%.4f,\"o\":%.3f,\"v\":%d,\"s\":%d}",
+diff --git a/src/contacts/config.hpp b/src/contacts/config.hpp
+index a9a0b2f..9c1b886 100644
+--- a/src/contacts/config.hpp
++++ b/src/contacts/config.hpp
+@@ -5,6 +5,7 @@
+ 
+ #include "detection/config.hpp"
+ #include "stability/config.hpp"
++#include "tracking/config.hpp"
+ #include "validation/config.hpp"
+ 
+ #include <common/types.hpp>
+@@ -25,6 +26,7 @@ public:
+ 
+ 	// The configuration options for the stabilization phase.
+ 	stability::Config<T> stability {};
++	tracking::Config<T> tracking {};
+ };
+ 
+ } // namespace iptsd::contacts
+diff --git a/src/contacts/finder.hpp b/src/contacts/finder.hpp
+index 09ea2ec..90bd6c5 100644
+--- a/src/contacts/finder.hpp
++++ b/src/contacts/finder.hpp
+@@ -28,7 +28,7 @@ private:
+ 	detection::Detector<T, TFit> m_detector;
+ 
+ 	// Tracks contacts over multiple frames.
+-	tracking::Tracker<T> m_tracker {};
++	tracking::Tracker<T> m_tracker;
+ 
+ 	// Stabilizes size and movement of contacts.
+ 	stability::Stabilizer<T> m_stabilizer;
+@@ -39,6 +39,7 @@ private:
+ public:
+ 	Finder(const Config<T> &config)
+ 		: m_detector {config.detection},
++		  m_tracker {config.tracking},
+ 		  m_stabilizer {config.stability},
+ 		  m_validator {config.validation} {};
+ 
+@@ -65,10 +66,11 @@ public:
+ 	 * @param[out] contacts The list of found contacts.
+ 	 */
+ 	template <int Rows, int Cols>
+-	void find(const ImageBase<T, Rows, Cols> &heatmap, std::vector<Contact<T>> &contacts)
++	void find(const ImageBase<T, Rows, Cols> &heatmap, std::vector<Contact<T>> &contacts,
++	          const f64 now_ms)
+ 	{
+ 		m_detector.detect(heatmap, contacts);
+-		m_tracker.track(contacts);
++		m_tracker.track(contacts, now_ms);
+ 		m_stabilizer.stabilize(contacts);
+ 		m_validator.validate(contacts);
+ 	}
+diff --git a/src/contacts/tracking/config.hpp b/src/contacts/tracking/config.hpp
+new file mode 100644
+index 0000000..6900fb3
+--- /dev/null
++++ b/src/contacts/tracking/config.hpp
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef IPTSD_CONTACTS_TRACKING_CONFIG_HPP
++#define IPTSD_CONTACTS_TRACKING_CONFIG_HPP
++
++#include <common/types.hpp>
++
++#include <type_traits>
++
++namespace iptsd::contacts::tracking {
++
++template <class T>
++struct Config {
++public:
++	static_assert(std::is_floating_point_v<T>);
++
++public:
++	/*
++	 * Max normalized distance a contact may move between two consecutive frames
++	 * and still be tracked as the same contact. Farther apart means lift and
++	 * reposition: the contact gets a fresh index and emits no stale delta.
++	 */
++	T reposition_ceiling = static_cast<T>(0.15);
++
++	/*
++	 * Max normalized distance between a contact that disappeared less than
++	 * grace_ms ago and a newly detected contact for the new contact to inherit
++	 * the old index. Bridges single-frame detection dropouts ("blinking").
++	 */
++	T lost_ceiling = static_cast<T>(0.06);
++
++	/*
++	 * How long a disappeared contact is remembered for re-matching, and how
++	 * long its index stays reserved so that a new contact cannot collide with
++	 * an index the consumer may still be holding. 0 disables the feature.
++	 */
++	f64 grace_ms = 0;
++};
++
++} // namespace iptsd::contacts::tracking
++
++#endif // IPTSD_CONTACTS_TRACKING_CONFIG_HPP
+diff --git a/src/contacts/tracking/tracker.hpp b/src/contacts/tracking/tracker.hpp
+index 096cba2..be64daa 100644
+--- a/src/contacts/tracking/tracker.hpp
++++ b/src/contacts/tracking/tracker.hpp
+@@ -4,6 +4,7 @@
+ #define IPTSD_CONTACTS_TRACKING_TRACKER_HPP
+ 
+ #include "../contact.hpp"
++#include "config.hpp"
+ #include "distances.hpp"
+ 
+ #include <common/casts.hpp>
+@@ -21,88 +22,129 @@ public:
+ 	static_assert(std::is_floating_point_v<T>);
+ 
+ private:
++	struct Lost {
++		Contact<T> contact;
++		f64 lost_at;
++	};
++
++	Config<T> m_config;
++
+ 	// The last frame.
+ 	std::vector<Contact<T>> m_last {};
+ 
+-	// The distances between all contacts from the current and the last frame.
+-	Image<T> m_distances {};
++	// Contacts that disappeared recently (within grace_ms), kept for re-matching.
++	std::vector<Lost> m_lost {};
+ 
+-	// Max normalized distance a contact may move between frames and still be
+-	// tracked as the same contact. Farther = lift+reposition; contact keeps its
+-	// fresh index and emits no stale delta. Suppresses scroll flyback.
+-	T m_reposition_ceiling = static_cast<T>(0.15);
++	// Candidates for matching: last frame followed by the lost contacts.
++	std::vector<Contact<T>> m_candidates {};
++	std::vector<bool> m_matched {};
++
++	// The distances between all contacts from the current frame and the candidates.
++	Image<T> m_distances {};
+ 
+ public:
++	Tracker(Config<T> config = {}) : m_config {config} {};
++
+ 	/*!
+ 	 * Resets the tracker by clearing the stored copy of the last frame.
+ 	 */
+ 	void reset()
+ 	{
+ 		m_last.clear();
++		m_lost.clear();
+ 	}
+ 
+ 	/*!
+-	 * Runs the contact tracking algorithm over the contacts from the current frame.
++	 * Assigns a unique index to every contact that is stable over consecutive frames.
+ 	 *
+-	 * @param[in,out] frame The list of contacts that will be tracked.
++	 * @param[in,out] frame The contacts of the current frame.
++	 * @param[in] now_ms A monotonic timestamp of the frame in milliseconds.
+ 	 */
+-	void track(std::vector<Contact<T>> &frame)
++	void track(std::vector<Contact<T>> &frame, const f64 now_ms)
+ 	{
++		// Forget lost contacts whose grace period has expired.
++		m_lost.erase(std::remove_if(m_lost.begin(), m_lost.end(),
++					    [&](const Lost &l) {
++						    return now_ms - l.lost_at > m_config.grace_ms;
++					    }),
++			     m_lost.end());
++
++		m_candidates.clear();
++		std::copy(m_last.begin(), m_last.end(), std::back_inserter(m_candidates));
++		for (const Lost &l : m_lost)
++			m_candidates.push_back(l.contact);
++
++		// Provisional indices: never collide with any index that is still in use
++		// by the last frame or reserved by a recently lost contact.
+ 		usize counter = 0;
+-
+-		// Assign unique indices to all contacts of the current frame.
+ 		for (Contact<T> &contact : frame) {
+ 			contact.index = this->find_new_index(counter);
+ 			counter = contact.index.value() + 1;
+ 		}
+ 
+-		if (!m_last.empty()) {
+-			const usize min = std::min(frame.size(), m_last.size());
+-
+-			// Calculate the distances between all contacts from the current and last
+-			// frame
+-			distances::calculate(frame, m_last, m_distances);
++		if (!m_candidates.empty()) {
++			const usize ncand = m_candidates.size();
++			const usize nlast = m_last.size();
++			const usize min = std::min(frame.size(), ncand);
++
++			m_matched.assign(ncand, false);
++			distances::calculate(frame, m_candidates, m_distances);
++
++			// Lost contacts may only re-attach within a tighter radius.
++			for (usize y = nlast; y < ncand; y++) {
++				for (Eigen::Index x = 0; x < m_distances.cols(); x++) {
++					if (m_distances(casts::to_eigen(y), x) > m_config.lost_ceiling)
++						m_distances(casts::to_eigen(y), x) =
++							Eigen::NumTraits<T>::infinity();
++				}
++			}
+ 
+-			// Copy the old indices back for the amount of contacts that can be tracked.
+ 			for (usize i = 0; i < min; i++) {
+ 				Eigen::Index y = 0;
+ 				Eigen::Index x = 0;
+ 
+ 				const T dist = m_distances.minCoeff(&y, &x);
+ 
+-				// Lift+reposition guard: nearest match too far to be real motion → stop
+-				// inheriting indices. minCoeff returns the smallest remaining distance, so
+-				// once it exceeds the ceiling every other unmatched pair is too far as well.
+-				if (dist > m_reposition_ceiling)
++				// Nearest remaining pair too far apart to be real motion: stop
++				// inheriting indices. Every other unmatched pair is farther still.
++				if (dist > m_config.reposition_ceiling)
+ 					break;
+ 
+-				// Copy the index of the contact
+-				frame[casts::to_unsigned(x)].index =
+-					m_last[casts::to_unsigned(y)].index;
++				frame[casts::to_unsigned(x)].index = m_candidates[casts::to_unsigned(y)].index;
++				m_matched[casts::to_unsigned(y)] = true;
+ 
+-				// Invalidate all entries containing these contacts
+ 				m_distances.row(y) = Eigen::NumTraits<T>::infinity();
+ 				m_distances.col(x) = Eigen::NumTraits<T>::infinity();
+ 			}
+ 
+-			m_last.clear();
++			// Lost contacts that re-attached are no longer lost. m_lost still
++			// corresponds 1:1 to candidates [nlast, ncand) at this point.
++			usize k = nlast;
++			m_lost.erase(std::remove_if(m_lost.begin(), m_lost.end(),
++						    [&](const Lost &) { return m_matched[k++]; }),
++				     m_lost.end());
++
++			// Contacts of the last frame that found no successor become lost.
++			if (m_config.grace_ms > 0) {
++				for (usize y = 0; y < nlast; y++) {
++					if (!m_matched[y])
++						m_lost.push_back(Lost {m_last[y], now_ms});
++				}
++			}
+ 		}
+ 
+-		// Save a copy of the new data
++		m_last.clear();
+ 		std::copy(frame.begin(), frame.end(), std::back_inserter(m_last));
+ 	}
+ 
+ private:
+ 	/*!
+-	 * Searches for an index that is not already used by a contact from the last frame.
+-	 *
+-	 * @param[in] min The new index has to be at least this value.
+-	 * @return A new unique index that was not used before.
++	 * Finds the lowest index that is not used by the last frame or a lost contact.
+ 	 */
+ 	[[nodiscard]] usize find_new_index(usize min) const
+ 	{
+ 		while (true) {
+-			if (!Contact<T>::find_in_frame(min, m_last).has_value())
++			if (!Contact<T>::find_in_frame(min, m_candidates).has_value())
+ 				return min;
+ 
+ 			min++;
+diff --git a/src/core/generic/application.hpp b/src/core/generic/application.hpp
+index 9f90c52..cc93297 100644
+--- a/src/core/generic/application.hpp
++++ b/src/core/generic/application.hpp
+@@ -21,6 +21,7 @@
+ #include <spdlog/spdlog.h>
+ 
+ #include <functional>
++#include <chrono>
+ #include <vector>
+ 
+ namespace iptsd::core {
+@@ -147,6 +148,16 @@ protected:
+ 	 */
+ 	virtual void on_touch(const std::vector<contacts::Contact<f64>> & /* unused */) {};
+ 
++	/*!
++	 * Monotonic timestamp of the frame being processed, in milliseconds.
++	 * Overridable so that offline replays can supply frame-based time.
++	 */
++	virtual f64 frame_time_ms()
++	{
++		using clock = std::chrono::steady_clock;
++		return std::chrono::duration<f64, std::milli>(clock::now().time_since_epoch()).count();
++	}
++
+ 	/*!
+ 	 * For running application specific code that futher processes stylus inputs.
+ 	 */
+@@ -198,7 +209,7 @@ private:
+ 		m_heatmap = 1.0 - norm;
+ 
+ 		// Search for contacts
+-		m_finder.find(m_heatmap, m_contacts);
++		m_finder.find(m_heatmap, m_contacts, this->frame_time_ms());
+ 
+ 		// Invert contact coordinates if neccessary
+ 		for (contacts::Contact<f64> &contact : m_contacts) {
+diff --git a/src/core/generic/config.hpp b/src/core/generic/config.hpp
+index 93033b4..6eff939 100644
+--- a/src/core/generic/config.hpp
++++ b/src/core/generic/config.hpp
+@@ -36,6 +36,7 @@ public:
+ 	f64 touchpad_overshoot = 0.5;
+ 	f64 touchpad_button_debounce_ms = 25;
+ 	f64 touchpad_lift_grace_ms = 0;
++	f64 touchpad_position_smoothing = 0;
+ 
+ 	// [Contacts]
+ 	std::string contacts_neutral = "mode";
+@@ -127,6 +128,9 @@ public:
+ 			this->contacts_position_thresh_min / diagonal,
+ 			this->contacts_position_thresh_max / diagonal,
+ 		};
++		// Remember lost contacts as long as the daemon holds their slots.
++		config.tracking.grace_ms = this->touchpad_lift_grace_ms;
++
+ 		config.stability.orientation_threshold = Vector2<f64> {
+ 			this->contacts_orientation_thresh_min / 180,
+ 			this->contacts_orientation_thresh_max / 180,
+diff --git a/src/core/linux/config-loader.hpp b/src/core/linux/config-loader.hpp
+index 1e06ddd..214ea95 100644
+--- a/src/core/linux/config-loader.hpp
++++ b/src/core/linux/config-loader.hpp
+@@ -162,6 +162,7 @@ private:
+ 		this->get(ini, "Touchpad", "Overshoot", m_config.touchpad_overshoot);
+ 		this->get(ini, "Touchpad", "ButtonDebounceMs", m_config.touchpad_button_debounce_ms);
+ 		this->get(ini, "Touchpad", "LiftGraceMs", m_config.touchpad_lift_grace_ms);
++		this->get(ini, "Touchpad", "PositionSmoothing", m_config.touchpad_position_smoothing);
+ 
+ 		this->get(ini, "Contacts", "Neutral", m_config.contacts_neutral);
+ 		this->get(ini, "Contacts", "NeutralValue", m_config.contacts_neutral_value);
+-- 
+2.56.0
+

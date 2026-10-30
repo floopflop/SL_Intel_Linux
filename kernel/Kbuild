@@ -1,0 +1,2 @@
+# DKMS entry point: fetch-sources.sh (PRE_BUILD) fills src/ for the kernel being built for.
+obj-m += src/

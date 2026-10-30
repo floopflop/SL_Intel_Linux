@@ -1,0 +1,18 @@
+[Unit]
+Description=Build the Surface Laptop 7 (Intel) kernel modules for the running kernel if DKMS has not yet
+# Fallback for the build that normally happens when a kernel package is installed: fetching the
+# sources needs the network, and Fedora's own dkms.service runs before networking (ordering it
+# after the network would create a dependency cycle that systemd breaks by dropping a job,
+# sometimes NetworkManager). This unit runs after the network instead and does not delay login.
+# dkms autoinstall is a no-op when the modules are already installed for this kernel.
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/dkms/surface-laptop-7-intel
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/dkms autoinstall --kernelver %v
+
+[Install]
+WantedBy=multi-user.target
