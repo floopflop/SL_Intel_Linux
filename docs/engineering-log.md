@@ -735,3 +735,38 @@ upgrade, and a udev PROGRAM failure is invisible. Link such helpers statically (
 toolchain), make `status` check that they start, and run `status` after every release upgrade. A udev rule
 that tags a device for systemd must match change events as well as add, or the first bare `udevadm trigger`
 takes the bound service down.
+
+## 2026-11-04 evening: second laptop, same upgrade: `install.sh all` never got past deps
+The second machine (model 2108) went 44 -> 45 the same afternoon and came back with the touchpad in the
+firmware's mouse mode as above. The difference: the user had run `sudo ./install.sh all` from a fresh clone
+at 48ab800 at 16:39, still on the fc44 kernel, before the upgrade, and again at 17:19 on fc45, and believed
+the static iptsd was in place. It was not: the binaries in /usr/local were still the Oct 29 ones (dynamic,
+libfmt.so.11 and libspdlog.so.1.15 "not found"), 50-iptsd.rules still matched ACTION=="add", and no iptsd@
+unit existed. Both `all` runs had lasted about 17 s. /var/log/dnf5.log has the reason for each: after the
+`dnf install` of the dependency list, cmd_deps ran `dnf builddep -y --enablerepo=fedora-source,updates-source
+libcamera`, which ended with "Failed to parse some inputs" at 16:39:51 and 17:19:56, the second the sudo
+session closed. Under set -e that took configs, kernel, iptsd and libcamera with it, and nothing said so:
+the terminal output ends with dnf's "No package matched libcamera".
+Cause: the version lock cmd_libcamera adds (libcamera, libcamera-ipa, libcamera-tools at 0.7.2-2.sl7.fc44,
+/etc/dnf/versionlock.toml, Oct 29 17:00) hides every other libcamera package from dnf, the source package
+included: `dnf repoquery --srpm libcamera` returns nothing, with `--setopt=disable_excludes='*'` it returns
+libcamera-0.7.2-3.fc45.src, and that lock is the only exclude on the machine (no exclude= in dnf.conf or any
+repo file). `dnf download --source libcamera`, which libcamera/fedora-rpm.sh uses, is not affected (it prints
+the same source URL with and without the bypass), so only the builddep needed a change. install.log from
+Oct 29 17:04 on this machine ends with the same error, so `all` has failed this way on every re-run since
+the first install, on every machine that completed one; the first install works because the lock does not
+exist yet when deps runs. The upgrade-survival work in the previous entry assumed `all` was re-runnable.
+Recovery was `sudo ./install.sh iptsd` at 17:28:58: the static build took 25 s, udevadm trigger started
+iptsd@dev-hidraw2.service at 17:29:24 ("Running in Touchpad mode", IPTSD Virtual Touchpad 045E:0C9F as
+input32), no reboot. Everything else had survived on its own, as on the first machine: DKMS built the four
+modules for 7.2.15-300.fc45 at 17:17:02 inside the upgrade transaction, all ten files under configs/ are
+byte-identical to what is installed, the sl7 libcamera RPMs are in ~/rpmbuild so cmd_libcamera would not
+rebuild. The offline-upgrade boot (17:10-17:17) also showed the udisks2 case from above a second time:
+iptsd@dev-hidraw2 started 17:10:09, "Stopping" at 17:13:55 with no restart. The "Ignoring unknown escape
+sequences" lines at 17:18 and 17:19 were the old resume unit; the new one arrived with the iptsd step.
+Fix (97009ae): the builddep passes --setopt=disable_excludes='*' and a failure is a WARNING ("needed only
+to rebuild libcamera"); the build dependencies must never stop the kernel, configs and iptsd steps.
+Verified without root: the new command resolves to "Nothing to do", exit 0, where the old one failed.
+Lesson: under set -e every step of "all" is a gate for the steps after it, so a step may only be fatal when
+the later steps cannot do without it. Package-manager excludes apply to source packages too, and a dnf5
+"Failed to parse some inputs" on a name that plainly exists means a lock or exclude is hiding it.
