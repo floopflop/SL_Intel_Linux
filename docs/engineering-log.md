@@ -640,3 +640,98 @@ platform profile), iptsd all fine on that machine.
 Result: `install.sh configs` from the new tarball on both machines; user confirms Wi-Fi back and no ordering
 cycle in the journal (2026-10-29 evening). Three clean installs on the second machine in total; the install
 path is now considered validated including the Secure Boot / MOK flow.
+
+## 2026-11-04: Fedora 44 -> 45 upgrade (kernel 7.2.15-300.fc45): touchpad back in the firmware's mouse mode
+Report after the release upgrade: touchpad "no multi-touch, feels very twitchy", everything else seems to work.
+What survived (same upstream kernel 7.2.15 as the last fc44 build, so nothing changed on the kernel side):
+DKMS rebuilt the four modules for 7.2.15-300.fc45 during the upgrade transaction, all four load from
+extra/ signed with the enrolled MOK; SAM up (6 devices: battery, charger, fan, platform profile, keyboard,
+sensor hub); camera (IPU7 firmware authenticated, ov02c10 bound, "Built-in Front Camera" PipeWire node,
+tuning file in place); speakers (sof-soundwire card with Speaker and Headphones sinks); Bluetooth; GPE 0xAB
+masked; serial-hub wakeup enabled. libcamera stayed at 0.7.2-2.sl7.fc44 through the version lock; Fedora 45
+ships 0.7.2-3 (same soname 0.7) and pipewire-plugin-libcamera 1.6.11-1.fc45 links libcamera.so.0.7, so the
+camera stack is consistent and needs nothing.
+Touchpad: no iptsd@ unit this boot. /dev/hidraw2 (quickspi-hid 045E:0C9F) exists and 50-iptsd.rules is in
+place, but its PROGRAM, /usr/local/bin/iptsd-check-device, exits 127: "error while loading shared libraries:
+libfmt.so.11: cannot open shared object file". The upgrade replaced fmt 11.2.0 -> 12.1.0 (libfmt.so.11 ->
+.12) and spdlog 1.15.3 -> 1.17.0 (libspdlog.so.1.15 -> .1.17); the binaries built on Nov 1 linked both
+dynamically. udev treats a failing PROGRAM as a non-match and logs nothing, so SYSTEMD_WANTS was never set
+and the journal has no trace of the failure (the last iptsd@ start, 09:33:31, is in the fc44-kernel
+offline-update boot that ran the upgrade transaction; it was stopped at 09:37:15 by the udisks2 scriptlet's
+`udevadm trigger`, see the udev paragraph below; no boot on the fc45 kernel has one). The firmware
+stayed in its native HID mode, served only by hid-multitouch's "quickspi-hid 045E:0C9F Mouse"/"Touchpad"
+nodes: relative motion, no gestures, no palm rejection, none of the iptsd tuning, hence twitchy.
+Fix: iptsd/build.sh now passes --force-fallback-for=fmt,spdlog,inih. iptsd's own meson build carries wraps
+for the three and builds fallbacks with default_library=static, so the installed binaries depend only on
+the toolchain's runtime, glibc, libstdc++ and libgcc_s (wrap versions fmt 12.0.0, spdlog 1.15.3, inih r62; the
+wrap sources are cached in
+iptsd/src/subprojects/packagecache, so later rebuilds need no network). First attempt failed at the LTO link:
+with the library code now recompiled under the project's flags, GCC 16.2.1 reports a -Wstringop-overflow
+false positive in fmt 12's write_fixed (fmt/format.h:1197, "writing 2 bytes into a region of size 0 ... at
+offset [-13, -3]") and iptsd's werror=true turns it into an error; build.sh sets -Dwerror=false (LTO kept).
+meson install would also have put libfmt.a, libspdlog.a, libinih.a, libINIReader.a, their pkg-config files and
+the spdlog/inih headers into /usr/local (where /usr/local/include shadows the system headers for every other
+local build), so install.sh iptsd installs with --skip-subprojects. install.sh iptsd rebuilds a tree that is
+missing, still linked dynamically, whose libraries are gone, or that meson would refuse because another
+meson major.minor configured it (Fedora rebases meson at every release; the configuring version is read from
+meson-info/meson-info.json and compared with `meson --version`; a first attempt used `meson introspect` as the
+probe, which only reads that JSON and never checks the version, caught by the review), retries the install
+after a rebuild if it still fails, installs the resume unit too,
+checks that both installed binaries start, restarts a running instance, triggers the hidraw add event, and
+reports whether an iptsd@ unit is running and the IPTSD Virtual Touchpad exists; `status` says CANNOT
+START / NOT RUNNING with the reason; tools/report.sh prints the ldd state and the touchpad input nodes.
+The resume unit's ExecStart is now a single `systemctl restart 'iptsd@*.service'`, with the `-` prefix so a
+failed restart does not fail the unit (systemd, 259 on Fedora 44
+already and 262 now, logged "Ignoring unknown escape sequences" for the `\$1` in the sh -c line every time
+the unit was loaded: boot, daemon-reload, suspend; the unit worked regardless; systemctl's glob matches
+loaded units and exits 0 when none match, verified with the user manager).
+Result: build.sh succeeds (24 -Wstringop-overflow warnings, all in fmt), ldd of every binary in iptsd/src/build/src
+lists only libstdc++.so.6, libm.so.6, libgcc_s.so.1 and libc.so.6; iptsd and iptsd-check-device start; iptsd
+1.13 MB (was 0.78 MB dynamically linked). Installed with `sudo ./install.sh iptsd` at 13:14 (after the review
+below, so with patch 0009): udev's database for hidraw2 now carries CURRENT_TAGS=:seat:systemd: and
+SYSTEMD_WANTS=iptsd@dev-hidraw2.service, the unit started at once ("Running in Touchpad mode", IPTSD Virtual
+Touchpad 045E:0C9F as input32), `status` reports it running with the virtual touchpad present, and /usr/local
+holds no subproject headers or libraries. No reboot was needed. A suspend/resume a minute earlier (13:13) had
+shown the old resume unit one last time: with no iptsd@ instance loaded its `[ -n "$units" ] && ...` exited 1
+and systemd logged the oneshot as failed; the new ExecStart exits 0 in that case.
+Review (54 agents: 4 lenses, 3 refuters per finding, 2 independent audits of the machine) found a second,
+independent way to lose the touchpad: iptsd's 50-iptsd.rules matches ACTION=="add" only. udev rewrites a
+device's database entry from the rules that match each event, so after a "change" event on the hidraw node
+the entry has neither the systemd tag nor SYSTEMD_WANTS; systemd (CURRENT_TAGS check since v247) then treats
+dev-hidraw2.device as gone, BindsTo= stops iptsd@dev-hidraw2.service, StopWhenUnneeded lets it be
+garbage-collected, and nothing starts it again until the next "add" (boot, or the sleep hook after resume).
+A bare `udevadm trigger` is a "change" for every device, and the udisks2, nvme-cli and qatlib-service
+scriptlets run one at every update of those packages: the journal of the upgrade boot shows exactly that
+(09:37:15 `Upgrading udisks2` -> boltd "device changed" -> `Stopping iptsd@dev-hidraw2.service`, no start
+afterwards). Reproduced read-only for the ACTION match: `udevadm test --action=change /sys/class/hidraw/hidraw2`
+yields CURRENT_TAGS=:seat: and no SYSTEMD_WANTS, `--action=add` yields both (udevadm test skips PROGRAM=
+execution and treats it as a match with an empty $result, so it shows `iptsd@.service` and proves nothing about
+iptsd-check-device; the real database is `udevadm info`). Fixed in iptsd patch 0009: the rule
+matches `ACTION!="remove"`, so the tag and the Wants= are re-applied on change and systemd leaves the
+active unit alone. Running iptsd-check-device on change events while iptsd holds the node is harmless: it only
+constructs the Runner (open, HIDIOCGRAWINFO/HIDIOCGRDESC, a get-feature of the metadata report) and never
+calls run(), the only place that sends the mode-setting feature report (src/core/linux/runner.hpp). The same
+patch makes iptsd's system-sleep hook exit 0 in the "pre" phase (its only command
+was `[ "$1" = post ] && udevadm trigger ...`, so systemd-sleep logged a failure at every suspend) and passes
+the configure_file() results to install_data() by reference (meson warned this becomes an error in Meson 2.0,
+which would stop build.sh once the distribution ships Meson 2.0). Manual recovery for an iptsd stopped this way:
+`sudo udevadm trigger --action=add --subsystem-match=hidraw`; never a bare `udevadm trigger`.
+Also from the review: tools/tpcheck.sh matched the first "quickspi-hid" input node, which is one of the
+three UNKNOWN nodes that never report, so its raw-node counter always read 0; it now samples the Mouse
+and Touchpad nodes. The post-install start check in install.sh re-ran the failing binary in a pipeline,
+which under set -e/pipefail would have aborted the script on the diagnostic path (fixed with || true).
+A second round (42 agents) over patch 0009, install.sh and the docs found no defect in the rule, the hook, the
+resume unit or the install order; it corrected the dead `meson introspect` probe, the `udevadm test` hint in
+install.sh's warning (udevadm test never runs PROGRAM=, so it passes in exactly the broken state; the hint and
+the README now point at running iptsd-check-device by hand and at `udevadm info`), and nine wording errors here
+and in the README.
+Noted, not acted on: two `power_supply BAT1: driver failed to report present/status: -110` SAM timeouts at
+106 s and 115 s into the current (fourth) fc45 boot, during GNOME session start-up (first ever; battery reads
+fine since); the RTC is kept in local time (timedatectl warns), which makes the kernel's early-boot journal
+timestamps appear 5 h early; tap-to-click not working is a GNOME setting (off on this unit), not an iptsd
+symptom, so the README's hint to enable it stands.
+Lesson: anything built locally against the distribution's C++ libraries breaks silently at a release
+upgrade, and a udev PROGRAM failure is invisible. Link such helpers statically (or against nothing but the
+toolchain), make `status` check that they start, and run `status` after every release upgrade. A udev rule
+that tags a device for systemd must match change events as well as add, or the first bare `udevadm trigger`
+takes the bound service down.

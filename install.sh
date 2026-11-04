@@ -110,7 +110,7 @@ cmd_deps() {
     # kernel's kernel-core in, but not its kernel-modules. Ask for the running kernel's version explicitly
     # and complete any kernel that ended up half installed.
     dnf install -y --skip-unavailable dkms "kernel-devel-$K" "kernel-devel-matched-$K" gcc make curl python3 git \
-      meson ninja-build gcc-c++ cmake eigen3-devel fmt-devel spdlog-devel cli11-devel inih-devel guidelines-support-library-devel \
+      meson ninja-build gcc-c++ cmake eigen3-devel cli11-devel guidelines-support-library-devel \
       rpm-build rpmdevtools dnf5-plugins libcamera libcamera-tools pipewire-plugin-libcamera pipewire-v4l2 \
       mokutil keyutils openssl
     complete_fedora_kernels
@@ -119,12 +119,12 @@ cmd_deps() {
     ;;
   debian)
     echo "Install: sudo apt install dkms linux-headers-\$(uname -r) build-essential curl python3 meson ninja-build cmake"
-    echo "  libeigen3-dev libfmt-dev libspdlog-dev libcli11-dev libinih-dev libmsgsl-dev   (iptsd)"
+    echo "  libeigen3-dev libcli11-dev libmsgsl-dev   (iptsd; fmt, spdlog and inih are built from meson wraps)"
     echo "  and the libcamera build dependencies (apt build-dep libcamera), libcamera-tools, pipewire-v4l2";;
   arch)
-    echo "Install: sudo pacman -S dkms linux-headers base-devel curl python meson ninja cmake eigen fmt spdlog cli11 inih microsoft-gsl"
+    echo "Install: sudo pacman -S dkms linux-headers base-devel curl python meson ninja cmake eigen cli11 microsoft-gsl"
     echo "  and the libcamera makedepends (see the libcamera PKGBUILD), libcamera-tools, pipewire-v4l2";;
-  *) echo "Unknown distribution: install dkms, kernel headers for $K, gcc, make, curl, python3, meson, ninja, cmake, eigen3, fmt, spdlog, CLI11, inih, GSL, and the libcamera build dependencies.";;
+  *) echo "Unknown distribution: install dkms, kernel headers for $K, gcc, make, curl, python3, meson, ninja, cmake, eigen3, CLI11, GSL, and the libcamera build dependencies (fmt, spdlog and inih are built from meson wraps).";;
   esac
 }
 
@@ -195,18 +195,52 @@ cmd_configs() {
   [ -n "${SKIP_REGEN:-}" ] || regen_initramfs
 }
 
+# iptsd/build.sh links fmt, spdlog and inih statically: their sonames change between distribution
+# releases (Fedora 44 -> 45 replaced libfmt.so.11 and libspdlog.so.1.15) and a dynamically linked
+# iptsd-check-device then fails to start, so the udev rule never requests iptsd@.service and the
+# touchpad silently falls back to the firmware's mouse mode. A tree that is missing, was built the
+# old way, or whose libraries have disappeared is rebuilt.
+iptsd_dynamic_deps() { ldd "$1" 2>/dev/null | grep -E 'not found|libfmt|libspdlog|libINIReader|libinih' | awk '{print $1}' | paste -sd' ' || true; }   # || true: grep finds nothing in the good case (set -e, pipefail)
+# meson refuses a build directory configured by a meson with another major.minor (Fedora rebases meson at
+# every release); the version that configured the tree is recorded in meson-info/meson-info.json.
+iptsd_tree_meson_matches() {
+  local have want
+  have=$(meson --version 2>/dev/null) || return 1
+  want=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["meson_version"]["full"])' "$1/meson-info/meson-info.json" 2>/dev/null) || return 1
+  [ "$(cut -d. -f1,2 <<<"$have")" = "$(cut -d. -f1,2 <<<"$want")" ]
+}
+iptsd_needs_build() {
+  local b=$D/iptsd/src/build
+  [ -x "$b/src/iptsd" ] || return 0
+  iptsd_tree_meson_matches "$b" || return 0
+  [ -n "$(iptsd_dynamic_deps "$b/src/iptsd")" ]
+}
 cmd_iptsd() {
   need_root iptsd
-  [ -x "$D/iptsd/src/build/src/iptsd" ] || as_user "$D/iptsd/build.sh"
+  if iptsd_needs_build; then echo "== building iptsd (a few minutes; needs the network the first time for the wrap sources) =="; as_user "$D/iptsd/build.sh"; fi
+  local b deps units
+  units=$(systemctl list-units --plain --no-legend --state=running 'iptsd@*.service' | awk '{print $1}' | paste -sd' ')   # instances running the old binary
   echo "== installing iptsd to /usr/local =="
-  meson install -C "$D/iptsd/src/build" --no-rebuild >/dev/null
+  meson install -C "$D/iptsd/src/build" --no-rebuild --skip-subprojects >/dev/null \
+    || { echo "== meson install failed, rebuilding =="; as_user "$D/iptsd/build.sh"; meson install -C "$D/iptsd/src/build" --no-rebuild --skip-subprojects >/dev/null; }
   install -D -m 644 "$D/configs/etc/iptsd.d/99-surface-laptop-7-touchpad.conf" /etc/iptsd.d/99-surface-laptop-7-touchpad.conf
   install -D -m 644 "$D/configs/etc/libinput/local-overrides.quirks" /etc/libinput/local-overrides.quirks
-  systemctl daemon-reload; udevadm control --reload; udevadm trigger --subsystem-match=hidraw 2>/dev/null || true
-  units=$(systemctl list-units --plain --no-legend 'iptsd@*.service' | awk '{print $1}')
-  [ -n "$units" ] && systemctl restart $units
-  sleep 1; systemctl list-units --plain --no-legend 'iptsd@*.service' || true
-  echo "iptsd installed ($(/usr/local/bin/iptsd --version 2>/dev/null | head -1 || echo /usr/local/bin/iptsd))"
+  install -D -m 644 "$D/configs/etc/systemd/system/iptsd-resume.service" /etc/systemd/system/iptsd-resume.service
+  for b in iptsd iptsd-check-device; do
+    deps=$(iptsd_dynamic_deps /usr/local/bin/$b)
+    [ -z "$deps" ] || echo "WARNING: /usr/local/bin/$b depends on $deps (it will break at the next soname change; rebuild with iptsd/build.sh)"
+    /usr/local/bin/$b --help >/dev/null 2>&1 || { echo "ERROR: /usr/local/bin/$b does not start:"; /usr/local/bin/$b --help 2>&1 | head -3 || true; }
+  done
+  systemctl daemon-reload; systemctl enable iptsd-resume.service >/dev/null 2>&1 || true; udevadm control --reload
+  [ -z "$units" ] || systemctl restart $units   # pick up the new binary where iptsd was already running
+  # where it was not: the hidraw add event re-runs 50-iptsd.rules, which requests iptsd@<hidraw>.service
+  # for the touchpad's node (a no-op for an instance that is already active)
+  udevadm trigger --action=add --subsystem-match=hidraw 2>/dev/null || true; udevadm settle 2>/dev/null || true
+  sleep 2
+  units=$(systemctl list-units --plain --no-legend --state=running 'iptsd@*.service' | awk '{print $1}' | paste -sd' ')
+  if [ -n "$units" ] && grep -q 'IPTSD Virtual Touchpad' /proc/bus/input/devices; then echo "iptsd running ($units), virtual touchpad present"
+  elif [ -n "$units" ]; then echo "iptsd running ($units) but no IPTSD Virtual Touchpad device yet; check: journalctl -b -u 'iptsd@*'"
+  else echo "WARNING: no iptsd@ unit is running, the touchpad stays in the firmware's mouse mode. Check the udev helper on the touchpad's node (exit 0 expected): /usr/local/bin/iptsd-check-device /dev/hidrawN; echo \$?  then  udevadm info /dev/hidrawN | grep -E 'TAGS|SYSTEMD_WANTS'  and  journalctl -b -u 'iptsd@*'  (udevadm test does not run PROGRAM= and cannot show this)"; fi
 }
 
 cmd_libcamera() {
@@ -258,7 +292,17 @@ cmd_status() {
     local r found=; for r in .machine .platform; do keyctl list "%:$r" 2>/dev/null | grep -q 'DKMS module signing key' && found="$found $r"; done
     case "$sb" in *enabled*) echo ", DKMS key in kernel keyring:${found:- NONE (modules will be rejected)}";; *) echo ", DKMS key enrolled in MOK: $(mokutil --list-enrolled 2>/dev/null | grep -q 'DKMS module signing key' && echo yes || echo no)";; esac
   else echo; fi
-  printf '  iptsd: %s %s\n' "$(command -v iptsd || echo missing)" "$(systemctl list-units --plain --no-legend 'iptsd@*.service' 2>/dev/null | awk '{print $1, $4}' | head -1)"
+  local ib iu; ib=$(command -v iptsd || true)
+  if [ -z "$ib" ]; then echo "  iptsd: missing (run: sudo ./install.sh iptsd)"
+  elif ldd "$ib" 2>/dev/null | grep -q 'not found'; then
+    echo "  iptsd: $ib CANNOT START, missing $(ldd "$ib" | awk '/not found/{print $1}' | paste -sd' ') (distribution upgrade?); touchpad in firmware mouse mode. Rebuild: sudo ./install.sh iptsd"
+  elif ! "$ib" --help >/dev/null 2>&1; then
+    echo "  iptsd: $ib CANNOT START: $("$ib" --help 2>&1 | head -1); touchpad in firmware mouse mode. Rebuild: sudo ./install.sh iptsd"
+  else
+    iu=$(systemctl list-units --plain --no-legend 'iptsd@*.service' 2>/dev/null | awk '{print $1, $4}' | head -1)
+    if [ -n "$iu" ]; then echo "  iptsd: $ib, $iu, virtual touchpad $(grep -q 'IPTSD Virtual Touchpad' /proc/bus/input/devices && echo present || echo MISSING)"
+    else echo "  iptsd: $ib, NOT RUNNING (touchpad in firmware mouse mode; run: sudo ./install.sh iptsd, then: journalctl -b -u 'iptsd@*')"; fi
+  fi
   printf '  libcamera: %s\n' "$(rpm -q libcamera 2>/dev/null || cam --version 2>/dev/null | head -1 || echo unknown)"
   [ -f /usr/share/libcamera/ipa/simple/ov02c10.yaml ] && echo "  tuning: ov02c10.yaml present ($(grep -c 'flickerPeriod\|temporalStrength' /usr/share/libcamera/ipa/simple/ov02c10.yaml) of 2 recent keys)" || echo "  tuning: ov02c10.yaml MISSING"
 }

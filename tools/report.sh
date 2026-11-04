@@ -25,7 +25,10 @@ if [ "$(id -u)" = 0 ] && command -v lsinitrd >/dev/null; then for i in /boot/ini
 sec "network"; echo "NetworkManager / wait-online / dkms / our fallback: $(systemctl is-active NetworkManager NetworkManager-wait-online dkms.service surface-laptop-7-intel-dkms.service 2>&1 | paste -sd' ')"; ls /etc/systemd/system/dkms.service.d/ 2>/dev/null | sed 's/^/OLD DROP-IN STILL PRESENT: /'; systemctl show dkms.service -p Before -p After 2>/dev/null; nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device 2>/dev/null; rfkill list 2>/dev/null | head -8
 journalctl -b --no-pager 2>/dev/null | grep -iE 'ordering cycle|deleted to break' | cut -c1-220 | head -6
 journalctl -kb --no-pager -o short-monotonic 2>/dev/null | grep -iE 'iwlwifi|wlan|wlp' | head -12
-sec "touchpad"; systemctl list-units --plain --no-legend 'iptsd@*.service' 2>/dev/null; journalctl -b --no-pager -u 'iptsd@*' 2>/dev/null | tail -10
+sec "touchpad"; systemctl list-units --plain --no-legend 'iptsd@*.service' 2>/dev/null
+echo "binary: $(command -v iptsd || echo missing)"; ldd "$(command -v iptsd 2>/dev/null)" 2>/dev/null | grep -E 'not found|libfmt|libspdlog|libINIReader|libinih' | sed 's/^/  dynamic dependency (breaks at soname changes): /'
+grep -E '^N: Name=' /proc/bus/input/devices | grep -iE 'quickspi|IPTSD|touchpad' | sed 's/^/  input: /'
+journalctl -b --no-pager -u 'iptsd@*' 2>/dev/null | tail -10
 sec "camera"; ls -la /dev/video* 2>/dev/null | head -3; rpm -q libcamera libcamera-tools pipewire-plugin-libcamera 2>&1; timeout 15 cam -l 2>&1 | head -5
 sec "audio"; aplay -l 2>/dev/null | head -8
 sec "network/dnf log of the install (last run)"; grep -E 'dnf install -y --skip-unavailable dkms' /var/log/dnf5.log 2>/dev/null | tail -1; dnf5 history list 2>/dev/null | head -5

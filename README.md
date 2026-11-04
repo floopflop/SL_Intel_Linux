@@ -3,7 +3,8 @@
 Based on nierdal's bring-up work [here](https://github.com/linux-surface/linux-surface/issues/1710#issuecomment-5048324568) and Christian Schaller's work [here](https://blogs.gnome.org/uraeus/2026/10/15/aiandreverseengineerhardware/).
 
 Fixes for the Surface Laptop for Business 7th Edition with Intel (Lunar Lake, ACPI id MSHW0551,
-model 2107) on a stock distribution kernel. Developed and tested on Fedora 44 with kernel 7.2.x;
+model 2107) on a stock distribution kernel. Developed and tested on Fedora 44 with kernel 7.2.x and
+upgraded in place to Fedora 45;
 the kernel part fetches the sources for whatever kernel you run and should work on any
 distribution with 7.2 or newer. One command installs everything:
 
@@ -19,8 +20,10 @@ Before you start:
   `install.sh all`: the internal keyboard hangs off the Surface Aggregator Module, which the stock
   kernel does not know on this model. Wi-Fi and the touchpad work out of the box. If `git` is
   missing, `sudo dnf install git` first.
-- Network access is required: the kernel sources come from kernel.org, iptsd from GitHub and the
-  libcamera source package from Fedora. The libcamera rebuild is the slow part (tens of minutes).
+- Network access is required: the kernel sources come from kernel.org, iptsd and the three libraries
+  it links statically (fmt, spdlog, inih) from GitHub and wrapdb.mesonbuild.com, and the libcamera
+  source package from Fedora.
+  The libcamera rebuild is the slow part (tens of minutes).
 - Secure Boot can stay on. DKMS signs the modules with a machine owner key (MOK). With Secure Boot
   on, `install.sh` asks you to choose a one-time password, and the next boot shows the blue MOK
   manager for about ten seconds: press a key before it times out, then Enroll MOK, Continue, Yes,
@@ -38,7 +41,7 @@ Before you start:
 | Webcam frame rate | 18.8 fps and a wrong pixel rate: the sensor runs from a 12 MHz clock, the driver only knows 19.2 MHz | Accept 12 MHz and scale both PLL multipliers (400 to 640) | `ov02c10` module |
 | Webcam trails | Flickering horizontal line fragments behind moving objects: IPU7 capture DMA does not snoop the CPU caches and the driver flushes buffers only once | Flush each buffer before it is queued and when it is dequeued | `intel-ipu7-isys` module |
 | Webcam picture | Flat, uncalibrated software ISP: vignetting, poor white balance, slow and bright exposure, noise, mains flicker bands | Lens shading from the module EEPROM, shading-aware AWB, fast exposure control with frame-length extension, anti-banding, spatial + temporal denoise, YUYV output for V4L2 apps | `libcamera/` patch + tuning |
-| Touchpad | Blinks at the end of gestures, twitchy cursor after resume, two close fingers merged, scroll too fast, no palm rejection | Tracker-level lift grace, evdev fuzz (libinput hysteresis), cluster merging in the detector, motion scaling, thresholds, libinput palm quirk | `iptsd/` patches + `configs/` |
+| Touchpad | Blinks at the end of gestures, twitchy cursor after resume, two close fingers merged, scroll too fast, no palm rejection; iptsd stopped until the next boot or resume by package updates that run `udevadm trigger` | Tracker-level lift grace, evdev fuzz (libinput hysteresis), cluster merging in the detector, motion scaling, thresholds, libinput palm quirk, udev rule that survives `change` events | `iptsd/` patches + `configs/` |
 | Keyboard dead at login screen | SAM keyboard appears ~8 s into boot, while the greeter starts | Load `surface_aggregator_registry` and `surface_hid` early | `configs/etc/modules-load.d` |
 | Keyboard, battery, power button dead for a whole boot | `surface_serial_hub: failed to setup IRQ`: when the SAM driver loads before the Lunar Lake pin controller (it does once it sits in the initramfs), its wake-GPIO lookup fails and the driver gives up instead of deferring | modprobe softdep loading `pinctrl_intel_platform` first | `configs/etc/modprobe.d` |
 | Camera gone after a DKMS build | dracut copies every out-of-tree module and its dependencies into the initramfs; the IPU7 driver then probes there without its firmware and never recovers | dracut omit list for the camera and audio modules | `configs/etc/dracut.conf.d` |
@@ -75,11 +78,22 @@ can also pull in the newest kernel's `kernel-core` without its `kernel-modules` 
 `kernel-devel-matched` dependency); `install.sh deps` completes such a kernel.
 
 **Touchpad.** `iptsd/build.sh` clones the alex-lentz fork of iptsd (it carries the Sensel haptic
-touchpad support this laptop needs), applies the eight patches in `iptsd/patches/`, and builds it;
-`install.sh iptsd` installs it to `/usr/local` together with the tuned configuration
-(`configs/etc/iptsd.d/`), the libinput palm quirk and a service that restarts iptsd after resume
-(the touchpad firmware falls back to its native mode after sleep). GNOME users may also want
-click-method `fingers` and tap-to-click.
+touchpad support this laptop needs), applies the nine patches in `iptsd/patches/`, and builds it
+with fmt, spdlog and inih from iptsd's own meson wraps, linked statically: the installed binaries
+depend only on the toolchain's runtime (glibc, libstdc++, libgcc_s). The distribution's sonames of
+two of them changed with this release (Fedora 44 to 45: fmt 11 to 12, spdlog 1.15 to 1.17; inih is
+built in as well so a future bump cannot bite), and a dynamically linked `iptsd-check-device` that no
+longer starts makes udev silently stop
+requesting the iptsd service, which leaves the touchpad in the firmware's raw mouse mode (see
+Troubleshooting). The ninth patch makes iptsd's udev rule match `change` events too: udev rebuilds a
+device's properties from the matching rules at every event, so after a bare `udevadm trigger` (the
+udisks2 and nvme-cli package scriptlets run one at every update) the touchpad's hidraw node lost its
+systemd tag, systemd stopped the iptsd service bound to it, and nothing started it again before the
+next boot. `install.sh iptsd` installs everything to `/usr/local` together with the tuned configuration
+(`configs/etc/iptsd.d/`), the libinput palm quirk and a service that restarts iptsd after resume (the
+touchpad firmware falls back to its native mode after sleep), rebuilding first when the built tree is
+missing, still linked dynamically, has lost its libraries, or was configured by another meson
+version. GNOME users may also want click-method `fingers` and tap-to-click.
 
 **Webcam.** `libcamera/libcamera-0.7.2-sl7.patch` is a patch against libcamera 0.7.2 (the version
 in Fedora 44). On Fedora, `libcamera/fedora-rpm.sh` rebuilds the distribution's source package with
@@ -107,8 +121,24 @@ environment disables the temporal filter for comparisons.
 
 ## Troubleshooting
 
-`./install.sh status` reports most of these. Kernel messages: `journalctl -kb`.
+`./install.sh status` reports most of these. Kernel messages: `journalctl -kb`. Run `status` after
+every distribution release upgrade (Fedora 44 to 45 broke only the touchpad daemon, see below; DKMS
+rebuilt the modules and the version lock kept libcamera).
 
+- **Touchpad twitchy, no gestures, no palm rejection**: iptsd is not running and the touchpad is in the
+  firmware's raw mouse mode (`sudo tools/tpcheck.sh` reports events only on the raw quickspi-hid
+  nodes). After a distribution upgrade `status` says `CANNOT START, missing libfmt.so.11
+  libspdlog.so.1.15`: the iptsd binaries were linked against libraries whose sonames the upgrade
+  changed, and udev ignores the failing `iptsd-check-device` without logging anything.
+  `sudo ./install.sh iptsd` rebuilds iptsd (statically linked since 2026-11-04, so this cannot recur
+  for fmt, spdlog or inih), reinstalls it and starts the service; no reboot is needed. `status` saying
+  `NOT RUNNING` with a binary that starts usually means a udev `change` event stopped it (iptsd built
+  before 2026-11-04; a package update ran `udevadm trigger`): `udevadm info /dev/hidrawN | grep
+  CURRENT_TAGS` on the touchpad's node then lacks `systemd`, and `journalctl -b | grep 'Stopping iptsd@'`
+  shows the stop. `sudo udevadm trigger --action=add --subsystem-match=hidraw` starts it again and
+  `sudo ./install.sh iptsd` installs the fixed rule. Otherwise run the udev helper by hand,
+  `sudo /usr/local/bin/iptsd-check-device /dev/hidrawN` (exit 0 and "is an IPTS device" expected;
+  `udevadm test` cannot show this, it does not run `PROGRAM=`), and read `journalctl -b -u 'iptsd@*'`.
 - **Internal keyboard, battery, AC and power button all missing for a boot**, with
   `surface_serial_hub serial0-0: error -EINVAL: failed to setup IRQ` in the log: the SAM driver
   probed before the pin controller. `sudo ./install.sh configs` installs the softdep and rebuilds

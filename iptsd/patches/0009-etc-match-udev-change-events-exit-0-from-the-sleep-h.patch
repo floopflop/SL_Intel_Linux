@@ -1,0 +1,87 @@
+From 4ff495e74cb4cecf9952e503552b61eb64036e63 Mon Sep 17 00:00:00 2001
+From: floopflop <floop@tuta.com>
+Date: Wed, 4 Nov 2026 12:03:09 -0500
+Subject: [PATCH] etc: match udev change events, exit 0 from the sleep hook,
+ meson 2.0-safe install_data
+
+50-iptsd.rules matched ACTION=="add" only. udev rewrites a device's database
+entry from the rules that match each event, so after a "change" event on the
+hidraw node (a bare `udevadm trigger`, which the udisks2, nvme-cli and
+qatlib-service package scriptlets run at every update of those packages) the
+entry has neither the systemd tag nor SYSTEMD_WANTS. systemd (v247 and later,
+which checks CURRENT_TAGS) then considers the device gone, BindsTo=%i.device
+stops the running iptsd@ instance, and nothing starts it again until the next
+"add" event: the touch device silently falls back to the firmware's native
+mode. Match every event but "remove" so the tag and the Wants= survive;
+systemd leaves an already active unit alone.
+
+The system-sleep hook's only command is `[ "$1" = post ] && udevadm trigger`,
+so the hook exits 1 in the "pre" phase and systemd-sleep logs a failure at
+every suspend. Exit 0.
+
+etc/meson.build passed the configure_file() outputs to install_data() by path
+string; meson warns that this becomes a hard error in Meson 2.0. Pass the
+returned file objects.
+---
+ etc/meson.build            | 7 ++-----
+ etc/systemd-sleep/iptsd    | 6 +++++-
+ etc/udev/50-iptsd.rules.in | 2 +-
+ 3 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/etc/meson.build b/etc/meson.build
+index dc7f56f..e7ea089 100644
+--- a/etc/meson.build
++++ b/etc/meson.build
+@@ -21,13 +21,13 @@ conf.set('bindir', bindir)
+ conf.set('datadir', datadir)
+ conf.set('sysconfdir', sysconfdir)
+ 
+-configure_file(
++unit = configure_file(
+ 	input: 'systemd/iptsd@.service.in',
+ 	output: 'iptsd@.service',
+ 	configuration: conf,
+ )
+ 
+-configure_file(
++rule = configure_file(
+ 	input: 'udev/50-iptsd.rules.in',
+ 	output: '50-iptsd.rules',
+ 	configuration: conf,
+@@ -48,9 +48,6 @@ if service_manager.contains('systemd')
+ 		udevdir = udev.get_variable(pkgconfig: 'udevdir')
+ 		rulesdir = join_paths(udevdir, 'rules.d')
+ 
+-		unit = join_paths(meson.current_build_dir(), 'iptsd@.service')
+-		rule = join_paths(meson.current_build_dir(), '50-iptsd.rules')
+-
+ 		install_data(unit, install_dir: unitdir)
+ 		install_data(rule, install_dir: rulesdir)
+ 		install_data(
+diff --git a/etc/systemd-sleep/iptsd b/etc/systemd-sleep/iptsd
+index e5c593b..7dd3c4e 100644
+--- a/etc/systemd-sleep/iptsd
++++ b/etc/systemd-sleep/iptsd
+@@ -1,4 +1,8 @@
+ #!/bin/bash
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-[ "$1" = "post" ] && udevadm trigger --action=add --subsystem-match=hidraw
++# After resume, re-run the hidraw "add" rules so that iptsd@ is (re)started for the touch device.
++if [ "$1" = "post" ]; then
++	udevadm trigger --action=add --subsystem-match=hidraw
++fi
++exit 0
+diff --git a/etc/udev/50-iptsd.rules.in b/etc/udev/50-iptsd.rules.in
+index d7b1352..c4cd436 100644
+--- a/etc/udev/50-iptsd.rules.in
++++ b/etc/udev/50-iptsd.rules.in
+@@ -1,4 +1,4 @@
+-SUBSYSTEM=="hidraw", ACTION=="add", TAG+="systemd", \
++SUBSYSTEM=="hidraw", ACTION!="remove", TAG+="systemd", \
+ 	PROGRAM="@bindir@/iptsd-check-device --quiet $env{DEVNAME}", \
+ 	PROGRAM="/bin/systemd-escape --path $env{DEVNAME}", \
+ 	ENV{SYSTEMD_WANTS}+="iptsd@$result.service"
+-- 
+2.56.0
+

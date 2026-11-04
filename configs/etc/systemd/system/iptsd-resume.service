@@ -4,7 +4,9 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'units=$(systemctl list-units --plain --no-legend "iptsd@*.service" | awk "{print \$1}"); [ -n "$units" ] && systemctl restart $units'
+# systemctl matches the glob against the loaded units (the running iptsd@dev-hidrawN.service);
+# with no match it does nothing and exits 0. The '-' ignores a failure of the restart itself.
+ExecStart=-/usr/bin/systemctl restart 'iptsd@*.service'
 
 [Install]
 WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
