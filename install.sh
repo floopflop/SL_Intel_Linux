@@ -114,7 +114,14 @@ cmd_deps() {
       rpm-build rpmdevtools dnf5-plugins libcamera libcamera-tools pipewire-plugin-libcamera pipewire-v4l2 \
       mokutil keyutils openssl
     complete_fedora_kernels
-    dnf builddep -y --enablerepo=fedora-source,updates-source libcamera
+    # The libcamera version lock that cmd_libcamera adds hides every other libcamera package from dnf,
+    # the source package included, so without disable_excludes this builddep fails with "No package
+    # matched libcamera" on every machine that already has the patched libcamera (every re-run, every
+    # distribution upgrade). The lock is the only exclude install.sh creates; `dnf download --source`
+    # in libcamera/fedora-rpm.sh is not affected. The build dependencies are only needed to rebuild
+    # libcamera, so a failure here must not stop the kernel, configs and iptsd steps of "all".
+    dnf builddep -y --setopt=disable_excludes='*' --enablerepo=fedora-source,updates-source libcamera \
+      || echo "WARNING: libcamera build dependencies not installed (needed only to rebuild libcamera; see above)"
     for t in dkms gcc meson cmake rpmbuild; do command -v $t >/dev/null || echo "WARNING: $t still missing"; done
     ;;
   debian)
