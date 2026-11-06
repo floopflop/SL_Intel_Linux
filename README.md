@@ -119,8 +119,12 @@ cell size; `vte/fedora-rpm.sh` rebuilds the distribution's `vte291` source packa
 terminals need a restart. Application-side knobs cannot do this: Claude Code, for instance, scrolls at
 least one line per wheel event in GTK terminals, so `CLAUDE_CODE_SCROLL_SPEED` below 1 has no effect
 there (its fractions work only on xterm.js-style terminals); with the patched VTE, 2 or 3 lines per event
-(`CLAUDE_CODE_SCROLL_SPEED=3`, acceleration off) matches GTK applications. Rebuild after a VTE update
-with `sudo ./install.sh vte` (it builds again when no patched RPM for the current version exists).
+(`CLAUDE_CODE_SCROLL_SPEED=3`, acceleration off) matches GTK applications. The lock holds this build
+until VTE fixes the issue upstream; then drop it and go back to the distribution's packages, as
+`uninstall.sh` does: `sudo dnf versionlock delete vte291 vte291-gtk4 vte-profile` and
+`sudo dnf distro-sync 'vte291*' vte-profile`. A Fedora release upgrade may force that decision earlier,
+if its Ptyxis needs a newer VTE: drop the lock, or run `vte/fedora-rpm.sh` once against the new source
+package (it says so if the patch needs porting).
 
 ## Tuning knobs
 
