@@ -29,6 +29,7 @@ sec "touchpad"; systemctl list-units --plain --no-legend 'iptsd@*.service' 2>/de
 echo "binary: $(command -v iptsd || echo missing)"; ldd "$(command -v iptsd 2>/dev/null)" 2>/dev/null | grep -E 'not found|libfmt|libspdlog|libINIReader|libinih' | sed 's/^/  dynamic dependency (breaks at soname changes): /'
 grep -E '^N: Name=' /proc/bus/input/devices | grep -iE 'quickspi|IPTSD|touchpad' | sed 's/^/  input: /'
 journalctl -b --no-pager -u 'iptsd@*' 2>/dev/null | tail -10
+echo "vte (GTK4 terminals): $(rpm -q vte291-gtk4 2>/dev/null || echo 'not installed')"
 sec "camera"; ls -la /dev/video* 2>/dev/null | head -3; rpm -q libcamera libcamera-tools pipewire-plugin-libcamera 2>&1; timeout 15 cam -l 2>&1 | head -5
 sec "audio"; aplay -l 2>/dev/null | head -8
 sec "network/dnf log of the install (last run)"; grep -E 'dnf install -y --skip-unavailable dkms' /var/log/dnf5.log 2>/dev/null | tail -1; dnf5 history list 2>/dev/null | head -5

@@ -770,3 +770,45 @@ Verified without root: the new command resolves to "Nothing to do", exit 0, wher
 Lesson: under set -e every step of "all" is a gate for the steps after it, so a step may only be fatal when
 the later steps cannot do without it. Package-manager excludes apply to source packages too, and a dnf5
 "Failed to parse some inputs" on a name that plainly exists means a lock or exclude is hiding it.
+
+## 2026-11-05: touchpad scrolling far too fast in Ptyxis only
+Report: touchpad right everywhere, but in Ptyxis "scrolls much too fast". Not the touchpad: libinput/iptsd deltas are
+global. Ptyxis 50.1 (VTE 0.84.1, GTK 4.24.1) sets VTE's scroll-unit-is-pixels and disables fallback scrolling, so the
+shell scrollback is scrolled by a GtkScrolledWindow in pixels: delta x MAGIC_SCROLL_FACTOR 2.5, the same as every GTK4
+app. The fast path is programs that capture the mouse: Widget::event_scroll (GTK4) passes the GtkEventControllerScroll
+deltas straight to Terminal::widget_mouse_scroll, and GTK4 reports touchpad deltas in GDK_SCROLL_UNIT_SURFACE, logical
+pixels, so one pixel of finger travel = one accumulated unit = one button 4/5 press (mouse tracking) or
+ceil(rows/10) fake Up/Down keys (alternate screen with mode 1007). VTE issue 2720 (open since 2024-01, same in master);
+Ptyxis issue 340 was closed for lack of information. On this machine the program in question is Claude Code's
+fullscreen TUI ("tui": "fullscreen" in ~/.claude/settings.json): it draws on the alternate screen, enables mouse
+reporting (the binary carries ?1000h/?1006h/?1049h/?1007h) and scrolls its own view.
+First attempt (Claude Code side, Ptyxis only): ~/.bashrc.d/claude-ptyxis-scroll exports CLAUDE_CODE_SCROLL_SPEED
+(0.15, then 0.1) only when PTYXIS_VERSION is set, plus wheelScrollAccelerationEnabled=false. Verified the running
+claude process had the variable (/proc/PID/environ). Still too fast, and reading the wheel handler in the binary
+explains why: for terminals it classifies as "native" (not xterm.js, not Windows Terminal, not JetBrains; Ptyxis is
+one) every path returns Math.max(1, Math.floor(mult)), i.e. at least one line per wheel event, and the default base
+there is already 1 (acceleration up to 6x). Fractional speeds only accumulate on the "decay curve" path for
+xterm.js-style terminals. So in Ptyxis the floor is one line per VTE wheel event, roughly one line per pixel, 35-40
+lines per centimetre, whatever the setting. Disabling the mouse (CLAUDE_CODE_DISABLE_MOUSE) would route the same
+pixel stream through VTE's alternate-scroll mode as arrow keys. The only lever left is the number of events per
+centimetre, which only VTE controls.
+Fix: a nine-line patch posted on vte#2720 (samar, 2026-10-29) divides SURFACE-unit deltas by the cell width/height
+in Widget::event_scroll, so one wheel unit is one text line of travel (what the GTK3 build effectively got from GTK's
+old divide-by-10). It applies unchanged to Fedora 45's vte291 0.84.1 (spec: inline %autorelease, pre-generated
+changelog, %autosetup -p1, no existing patches). New repo component, Fedora only and optional: vte/fedora-rpm.sh
+(download the SRPM, add Patch0, Release 1.sl7, rpmbuild -ba --nocheck, like libcamera/fedora-rpm.sh),
+install.sh vte (installs the twelve missing build dependencies with dnf builddep, builds as the user, installs
+vte291/vte291-gtk4/vte-profile, version-locks them, reminds that terminals must be restarted), status and report
+lines, uninstall hooks. iptsd-check-device is unaffected (it is a hidraw consumer, not a terminal).
+Result: `sudo ./install.sh vte` installed the eleven build dependencies, built vte291 0.84.1-1.sl7.fc45 (about
+three minutes; eleven RPMs including debuginfo) and then failed at the install step: the glob
+`vte291-gtk4-*.sl7*` also matched vte291-gtk4-devel-debuginfo, the release string came out as
+`devel-debuginfo-0.84.1-1.sl7.fc45` and dnf was handed two debuginfo packages ("nothing provides
+vte291-debuginfo"). Fixed with `vte291-gtk4-[0-9]*` (the version follows); the second run installed vte291,
+vte291-gtk4 and vte-profile 1.sl7 at 21:02 and version-locked them; Ptyxis restarted at 21:03 maps the new
+libvte-2.91-gtk4.so.0. Scrolling in Claude Code was then too slow: one wheel event per text line of travel
+and Claude Code's default of one line per event (the 0.1 drop-in floors to the same) gives 1:1, while GTK
+scrolled windows move 2.5 lines per line of travel. The Ptyxis-only drop-in now exports
+CLAUDE_CODE_SCROLL_SPEED=3 (acceleration still off); with sane event counts the knob finally does what it says.
+Lesson: fix the event source, not the consumer; and never match RPM files with `name-*`, the sub-packages share
+the prefix.

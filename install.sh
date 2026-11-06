@@ -5,6 +5,7 @@
 #   sudo ./install.sh configs    udev/systemd/libinput/wireplumber/modprobe/dracut files, kernel command line, initramfs rebuild
 #   sudo ./install.sh iptsd      touchpad daemon fork with the fixes (builds first if needed)
 #   sudo ./install.sh libcamera  patched libcamera 0.7.2 + OV02C10 tuning (Fedora RPM rebuild, or from source)
+#   sudo ./install.sh vte        optional, Fedora: VTE rebuilt so touchpad scrolling in Ptyxis/Console TUI programs is sane
 #   sudo ./install.sh deps       install build dependencies (Fedora; prints the list elsewhere)
 #        ./install.sh status     what is installed and active (no root needed)
 set -euo pipefail
@@ -120,8 +121,8 @@ cmd_deps() {
     # distribution upgrade). The lock is the only exclude install.sh creates; `dnf download --source`
     # in libcamera/fedora-rpm.sh is not affected. The build dependencies are only needed to rebuild
     # libcamera, so a failure here must not stop the kernel, configs and iptsd steps of "all".
-    dnf builddep -y --setopt=disable_excludes='*' --enablerepo=fedora-source,updates-source libcamera \
-      || echo "WARNING: libcamera build dependencies not installed (needed only to rebuild libcamera; see above)"
+    dnf builddep -y --setopt=disable_excludes='*' --enablerepo=fedora-source,updates-source libcamera vte291 \
+      || echo "WARNING: libcamera/vte build dependencies not installed (needed only to rebuild libcamera or vte; see above)"
     for t in dkms gcc meson cmake rpmbuild; do command -v $t >/dev/null || echo "WARNING: $t still missing"; done
     ;;
   debian)
@@ -276,6 +277,31 @@ cmd_libcamera() {
   echo "tuning: /usr/share/libcamera/ipa/simple/ov02c10.yaml"; restart_wireplumber
 }
 
+# Optional. VTE's GTK4 build (Ptyxis, GNOME Console) passes touchpad deltas, which GTK delivers in
+# pixels, straight to programs that capture the mouse: one wheel click per pixel of finger travel
+# (vte#2720, open). vte/vte-touchpad-scroll-units.patch divides them by the cell size. Fedora only:
+# the distribution's source package is rebuilt with the patch and version-locked, like libcamera.
+cmd_vte() {
+  need_root vte
+  [ $DISTRO = fedora ] || { echo "the VTE rebuild is implemented for Fedora (vte/fedora-rpm.sh); elsewhere apply vte/vte-touchpad-scroll-units.patch to your vte package"; exit 1; }
+  rpm -q vte291-gtk4 >/dev/null 2>&1 || { echo "vte291-gtk4 is not installed (no GTK4 VTE terminal here); nothing to do"; exit 0; }
+  local H R rel p pkgs=(); H=$(user_home); R=$H/rpmbuild/RPMS/x86_64
+  # vte291-gtk4-[0-9]*: the version follows, which keeps vte291-gtk4-devel-debuginfo-* out of the match
+  if ! ls "$R"/vte291-gtk4-[0-9]*.sl7*.x86_64.rpm >/dev/null 2>&1; then
+    echo "== vte291 build dependencies =="   # disable_excludes: the version lock this step adds would hide the vte291 source package next time
+    dnf builddep -y --setopt=disable_excludes='*' --enablerepo=fedora-source,updates-source vte291
+    echo "== rebuilding vte291 with the patch (several minutes) =="; as_user env RPMBUILD_DIR="$H/rpmbuild" "$D/vte/fedora-rpm.sh"
+  fi
+  rel=$(ls "$R"/vte291-gtk4-[0-9]*.sl7*.x86_64.rpm | sed -E 's/.*vte291-gtk4-//; s/\.x86_64\.rpm//' | sort -V | tail -1)   # e.g. 0.84.1-1.sl7.fc45
+  for p in vte291 vte291-gtk4 vte-profile vte291-devel vte291-gtk4-devel; do
+    rpm -q "$p" >/dev/null 2>&1 && [ -f "$R/$p-$rel.x86_64.rpm" ] && pkgs+=("$R/$p-$rel.x86_64.rpm"); done
+  for p in vte291 vte291-gtk4 vte-profile vte291-devel vte291-gtk4-devel; do dnf versionlock delete "$p" >/dev/null 2>&1 || true; done
+  echo "== installing vte291 $rel =="; dnf install -y "${pkgs[@]}"
+  dnf versionlock add vte291 vte291-gtk4 vte-profile >/dev/null 2>&1 || echo "(no dnf versionlock: a vte update would replace this build)"
+  echo "installed: $(rpm -q vte291-gtk4). Terminals load the new library when restarted: close every Ptyxis (or Console) window"
+  echo "and open it again; a Claude Code session running in it can be resumed afterwards with: claude --continue"
+}
+
 cmd_status() {
   echo "kernel $K  ($DISTRO)"
   for m in $MODULES; do
@@ -312,10 +338,16 @@ cmd_status() {
   fi
   printf '  libcamera: %s\n' "$(rpm -q libcamera 2>/dev/null || cam --version 2>/dev/null | head -1 || echo unknown)"
   [ -f /usr/share/libcamera/ipa/simple/ov02c10.yaml ] && echo "  tuning: ov02c10.yaml present ($(grep -c 'flickerPeriod\|temporalStrength' /usr/share/libcamera/ipa/simple/ov02c10.yaml) of 2 recent keys)" || echo "  tuning: ov02c10.yaml MISSING"
+  if command -v rpm >/dev/null && rpm -q vte291-gtk4 >/dev/null 2>&1; then
+    case "$(rpm -q --qf '%{RELEASE}' vte291-gtk4)" in
+      *sl7*) echo "  vte (GTK4 terminals): $(rpm -q vte291-gtk4), touchpad scroll patch";;
+      *) echo "  vte (GTK4 terminals): $(rpm -q vte291-gtk4), distribution build (touchpad scrolls TUI programs one line per pixel; optional: sudo ./install.sh vte)";;
+    esac
+  fi
 }
 
 case "${1:-help}" in
-  deps) cmd_deps;; kernel) cmd_kernel;; configs) cmd_configs;; iptsd) cmd_iptsd;; libcamera) cmd_libcamera;; status) cmd_status;;
+  deps) cmd_deps;; kernel) cmd_kernel;; configs) cmd_configs;; iptsd) cmd_iptsd;; libcamera) cmd_libcamera;; vte) cmd_vte;; status) cmd_status;;
   all) cmd_deps; SKIP_REGEN=1 cmd_configs; cmd_kernel; cmd_iptsd; cmd_libcamera; echo
        if [ -n "$KERNEL_FAILED" ]; then echo "NOT DONE: the kernel modules did not build (see the DKMS warning above and /var/lib/dkms/$DKMS_NAME/$DKMS_VER/build/make.log)."
        elif [ -n "$MOK_PENDING" ]; then echo "All done. Reboot now. Press a key when the blue MOK manager screen appears (it times out after ~10 s), then Enroll MOK, Continue, Yes, enter the password you chose, Reboot."

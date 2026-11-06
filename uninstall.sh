@@ -12,7 +12,7 @@ systemctl disable iptsd-resume.service surface-laptop-7-intel-dkms.service 2>/de
 command -v grubby >/dev/null && grubby --update-kernel=ALL --remove-args="acpi_mask_gpe=0xAB"
 [ -d "$D/iptsd/src/build" ] && ninja -C "$D/iptsd/src/build" uninstall >/dev/null 2>&1
 rm -f /usr/share/libcamera/ipa/simple/ov02c10.yaml
-if command -v dnf >/dev/null; then for n in libcamera libcamera-ipa libcamera-tools; do dnf versionlock delete $n >/dev/null 2>&1; done; echo "run: dnf distro-sync 'libcamera*'   to return to the distribution's libcamera"; fi
+if command -v dnf >/dev/null; then for n in libcamera libcamera-ipa libcamera-tools vte291 vte291-gtk4 vte-profile; do dnf versionlock delete $n >/dev/null 2>&1; done; echo "run: dnf distro-sync 'libcamera*' 'vte291*' vte-profile   to return to the distribution's libcamera and vte"; fi
 echo "removed; reboot to go back to the distribution's modules"
 [ -f /var/lib/dkms/mok.pub ] && echo "the DKMS signing key stays enrolled in the firmware; to remove it too: sudo mokutil --delete /var/lib/dkms/mok.pub (confirm at the next boot)"
 exit 0

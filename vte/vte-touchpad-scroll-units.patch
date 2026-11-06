@@ -1,0 +1,31 @@
+VTE (GTK4 build): convert touchpad scroll deltas to wheel units before counting clicks
+
+GTK4 delivers touchpad scrolling in surface units (logical pixels of finger travel), wheel
+scrolling in wheel units (one per notch). VTE's GTK4 widget passes the deltas through
+unchanged, so every pixel of two-finger travel becomes one wheel click for programs that
+capture the mouse (less, vim, htop, Claude Code's fullscreen UI) and ceil(rows/10) fake
+arrow keys on the alternate screen: the smallest motion scrolls a screenful. The GTK3 build
+got deltas pre-divided by GTK. Divide surface-unit deltas by the cell size, so one wheel
+unit is one text line of finger travel, which is what the GTK3 build and other terminals do.
+
+Upstream: https://gitlab.gnome.org/GNOME/vte/-/issues/2720 (open), patch by samar on that
+issue (2026-10-29), applies unchanged to vte 0.84.1. Drop this file once VTE fixes it.
+
+--- a/src/widget.cc
++++ b/src/widget.cc
+@@ -1322,6 +1322,15 @@ Widget::event_scroll(GtkEventControllerScroll* controller,
+ {
+         _vte_debug_print(vte::debug::category::EVENTS, "Scroll delta_x={:.3f} delta_y={:.3f}", dx, dy);
+ 
++        if (gtk_event_controller_scroll_get_unit(controller) == GDK_SCROLL_UNIT_SURFACE) {
++                auto const cell_width = terminal()->get_cell_width();
++                auto const cell_height = terminal()->get_cell_height();
++                if (cell_width > 0)
++                        dx /= cell_width;
++                if (cell_height > 0)
++                        dy /= cell_height;
++        }
++
+         auto event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(controller));
+         if (!event)
+                 return false;

@@ -50,6 +50,11 @@ Before you start:
 | Interrupt storm | SAM GPE 0xAB fires continuously | `acpi_mask_gpe=0xAB` on the kernel command line | `install.sh configs` |
 | Camera pickers | 30+ raw IPU7 V4L2 nodes listed next to the real camera | WirePlumber rule hiding them | `configs/etc/wireplumber` |
 
+Optional, not Surface-specific: `sudo ./install.sh vte` rebuilds Fedora's VTE (the terminal widget of
+Ptyxis and GNOME Console) with a one-hunk patch so that two-finger scrolling inside programs that capture
+the mouse (less, vim, htop, Claude Code's fullscreen UI) moves one wheel click per text line of finger
+travel instead of one per pixel (VTE issue 2720, open). See "Terminal scrolling" below.
+
 Not fixed: the SAM UART interrupt storm that can hang suspend (linux-surface issue #2263).
 
 ## How it works
@@ -103,6 +108,19 @@ it and `install.sh libcamera` installs and version-locks the result, installs th
 it over the system libcamera (pin the package afterwards). GNOME Camera, Firefox and other PipeWire
 clients use the camera directly; V4L2-only applications (Zoom) need `pipewire-v4l2`:
 `tools/zoom-camera.sh` launches Zoom through it.
+
+**Terminal scrolling (optional).** GTK4 delivers touchpad scrolling in pixels and wheel scrolling in
+notches; VTE's GTK4 build hands the deltas to mouse-capturing programs unconverted, so each pixel of
+finger travel is one wheel click (and, on the alternate screen, `ceil(rows/10)` fake arrow keys). Plain
+shell scrollback is unaffected (Ptyxis lets GTK scroll it, at the same speed as every GTK4 app), which
+is why only TUI programs feel wrong. `vte/vte-touchpad-scroll-units.patch` divides pixel deltas by the
+cell size; `vte/fedora-rpm.sh` rebuilds the distribution's `vte291` source package with it and
+`install.sh vte` installs and version-locks the result (`vte291`, `vte291-gtk4`, `vte-profile`), then
+terminals need a restart. Application-side knobs cannot do this: Claude Code, for instance, scrolls at
+least one line per wheel event in GTK terminals, so `CLAUDE_CODE_SCROLL_SPEED` below 1 has no effect
+there (its fractions work only on xterm.js-style terminals); with the patched VTE, 2 or 3 lines per event
+(`CLAUDE_CODE_SCROLL_SPEED=3`, acceleration off) matches GTK applications. Rebuild after a VTE update
+with `sudo ./install.sh vte` (it builds again when no patched RPM for the current version exists).
 
 ## Tuning knobs
 
