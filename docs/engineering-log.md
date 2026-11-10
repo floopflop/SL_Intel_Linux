@@ -886,3 +886,49 @@ Lesson: an unresumed suspend in the journal is not yet a hang; read the battery 
 with a synced marker, not with printk pairs. Before blaming the newest thing on the bus, check how often
 the machine slept with it; and before copying a hook from another distribution, ask the policy what a
 confined process may do.
+
+## 2026-11-10 afternoon: kernel 7.3.3 on the second laptop, and a cleared version lock
+The kernel packages on this machine had been locked by hand on Nov 5. To move to 7.3: `sudo dnf versionlock
+clear` (13:48), `sudo dnf upgrade` (250 packages), reboot, `sudo ./install.sh all` (13:52), reboot. Asked to
+check that nothing was left behind.
+`versionlock clear` removes every lock, so the same upgrade that brought kernel 7.3.3-300.fc45 (and removed
+7.2.14, bluez 5.87 -> 5.88) also replaced libcamera 0.7.2-2.sl7.fc44 with the distribution's 0.7.2-5.fc45.
+`all` put that right: its libcamera step found the sl7 RPMs in ~/rpmbuild, `dnf install` downgraded to them
+(transaction 21, action D, 6 packages) and re-added the three locks at 13:55:34. vte kept its build only
+because 0.84.1-1.sl7.fc45 sorts above the distribution's 0.84.1-1.fc45, and its three locks stayed gone: vte
+is optional and not a step of `all`. Nothing said so; `status` printed the sl7 package as before. Found by
+reading `dnf versionlock list`; the locks were re-added by hand. The next vte update would have replaced the
+build, and between the upgrade and `all` status would have shown libcamera-0.7.2-5.fc45 without comment.
+The kernel side went by itself. DKMS built for 7.3.3 inside the upgrade transaction (sources for v7.3.3
+cached at 13:49), so the first 7.3.3 boot at 13:51, before `all`, already loaded the out-of-tree registry
+module from its initramfs and had inherited acpi_mask_gpe=0xAB. `all` rebuilt for the three installed
+kernels at 13:53: four times "patched", "all patches applied", exit 0, only the pahole and BTF notes, so
+port-patches.py's edits still match the 7.3.3 sources. All four modules load from extra/, signed with the
+DKMS key. The other steps: deps (builddep libcamera vte291 through the lock bypass, nothing to install), the
+eleven config files identical to the repo, initramfs regenerated for all three kernels at 13:55, iptsd's
+static binaries of Nov 4 kept, no "Command returned error" in dnf5.log, no failed unit.
+On 7.3.3: SAM with six devices, battery and AC, keyboard, iptsd@dev-hidraw2 with the virtual touchpad,
+sof-soundwire with the Speaker and Headphones sinks, Wi-Fi, Bluetooth, GPE 0xAB masked with a count of 0, no
+interrupt storm. Camera: `cam -l` lists it and 75 frames run at a steady 29.80 fps (the anti-banding frame
+fit; the unpatched driver gives 18.8). Kernel warnings against the 7.2.15 boot of the same morning: nothing
+new but USB enumeration retries on the dock's hubs, of the kind 7.2.15 logged too. `csi2-0 error: Short
+packet discarded due to errors` comes once per stream start (GNOME Camera at 13:56:31, my capture at
+14:01:46) and is in four 7.2.x boots as well; libcamera's "Failed to retrieve the sensor crop rectangle" is
+in every boot. selinux-policy was not updated and bin_t hooks still transition to unconfined_service_t;
+sl7-suspend-log.sh is installed with that label and works on 7.3.3 when run by hand. No suspend on 7.3.3
+yet. Not checked (root only): the initramfs contents and the boot entries of the older kernels.
+Residue: /lib/modules/7.2.13-200.fc44.x86_64 and 7.2.14-200.fc44.x86_64 still exist with four stock modules
+each (156K). When DKMS removes its build for a kernel it puts the "original modules" back, after the kernel
+package has already removed the rest of the tree. Harmless; nothing cleans it up. The source caches for
+v7.2.13 and v7.2.14 (776K each) stay too.
+Change: `status` now prints `NOT VERSION-LOCKED: <names>` with the `dnf versionlock add` command under
+libcamera and vte when an installed sl7 build has no lock (`dnf versionlock list`, 0.05 s, no root; one
+query per run; dnf 4's NEVRA-pattern list is recognised too), a "version lock unknown" note when the
+versionlock command is missing, and marks an rpm libcamera that is not the sl7 build as `DISTRIBUTION
+BUILD` (the vte line already did): once an update has replaced an unlocked build there is no sl7 package
+left for the lock check to speak about. Tested by running the function from install.sh under set -euo
+pipefail with stubbed rpm and dnf: all locked, vte locks gone, one of three missing, no locks, versionlock
+unavailable, dnf 4 output, distribution build, no rpm; and on the machine, where everything is locked again
+and status is unchanged. README: a Troubleshooting entry for the two messages.
+Lesson: `dnf versionlock clear` is not "unlock the kernel"; `dnf versionlock delete <names>` is. A lock
+that only an optional step restores needs something that says when it is missing.

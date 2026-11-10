@@ -192,6 +192,14 @@ rebuilt the modules and the version lock kept libcamera).
   holds the key. Fedora's kernel accepts it from the platform keyring; a kernel that only consults
   the machine keyring needs the MOK certificate to be a CA certificate (`basicConstraints=CA:TRUE`,
   `keyUsage=keyCertSign`), so regenerate and re-enrol it that way.
+- **`status` says `NOT VERSION-LOCKED`, or that libcamera is a `DISTRIBUTION BUILD`**: the patched
+  libcamera and VTE packages are held by dnf version locks, and a lock is gone. `dnf versionlock
+  clear` removes every lock, not only the one in the way; to release one package use `sudo dnf
+  versionlock delete <name>`. A patched package without its lock is replaced by the next
+  distribution update without a word, and `install.sh all` restores libcamera's lock but not VTE's
+  (the VTE step is optional and not part of it). `sudo dnf versionlock add <names>`, as `status`
+  prints it, restores a lock; `sudo ./install.sh libcamera` or `sudo ./install.sh vte` reinstalls a
+  build that an update has already replaced and locks it again.
 - **The laptop does not come back from sleep** (lid opened, black screen, hard reset). First rule out
   an empty battery: sleep costs 1.5 to 2 W, so a laptop that went to sleep at 6% is off two and a half
   hours later, and the journal of that boot ends at `PM: suspend entry` exactly as it does after a

@@ -302,6 +302,29 @@ cmd_vte() {
   echo "and open it again; a Claude Code session running in it can be resumed afterwards with: claude --continue"
 }
 
+# The patched libcamera and vte packages (release "N.sl7") are held by dnf version locks; without
+# its lock a package is replaced by the next distribution update without a word. `dnf versionlock
+# clear` removes every lock, not only the one in the way: used to let a kernel update through, it
+# let the same `dnf upgrade` replace libcamera, and "all" restored libcamera's lock but not vte's
+# (vte is not one of its steps). $1 = label, the rest = the packages that step locks. Prints
+# nothing when every installed sl7 build is locked, and nothing for a distribution build.
+sl7_lock_check() {
+  local label=$1 p missing=; shift
+  command -v dnf >/dev/null && command -v rpm >/dev/null || return 0
+  if [ -z "${SL7_LOCKS_READ:-}" ]; then   # one query per status run (0.05 s, no root needed)
+    SL7_LOCKS_READ=1
+    SL7_LOCKS=$(dnf versionlock list 2>/dev/null) || SL7_LOCKS=unavailable
+  fi
+  for p in "$@"; do
+    case "$(rpm -q --qf '%{RELEASE}' "$p" 2>/dev/null)" in *sl7*) ;; *) continue;; esac
+    # dnf 5 prints "Package name: <name>", dnf 4 one "<name>-<epoch>:<version>..." pattern per line
+    grep -qxF "Package name: $p" <<<"$SL7_LOCKS" || grep -qE "^$p-[0-9]+:" <<<"$SL7_LOCKS" || missing="$missing $p"
+  done
+  [ -n "$missing" ] || return 0
+  if [ "$SL7_LOCKS" = unavailable ]; then echo "  $label: version lock unknown (dnf versionlock is not available); an update may replace the patched build"
+  else echo "  $label: NOT VERSION-LOCKED:$missing (the next update replaces the patched build; run: sudo dnf versionlock add$missing)"; fi
+}
+
 cmd_status() {
   echo "kernel $K  ($DISTRO)"
   for m in $MODULES; do
@@ -336,7 +359,13 @@ cmd_status() {
     if [ -n "$iu" ]; then echo "  iptsd: $ib, $iu, virtual touchpad $(grep -q 'IPTSD Virtual Touchpad' /proc/bus/input/devices && echo present || echo MISSING)"
     else echo "  iptsd: $ib, NOT RUNNING (touchpad in firmware mouse mode; run: sudo ./install.sh iptsd, then: journalctl -b -u 'iptsd@*')"; fi
   fi
-  printf '  libcamera: %s\n' "$(rpm -q libcamera 2>/dev/null || cam --version 2>/dev/null | head -1 || echo unknown)"
+  local lc; lc=$(rpm -q libcamera 2>/dev/null) || lc=
+  if [ -z "$lc" ]; then printf '  libcamera: %s\n' "$(cam --version 2>/dev/null | head -1 || echo unknown)"
+  else case "$(rpm -q --qf '%{RELEASE}' libcamera)" in
+    *sl7*) echo "  libcamera: $lc";;
+    *) echo "  libcamera: $lc, DISTRIBUTION BUILD: the patched build is not installed (replaced by an update?); run: sudo ./install.sh libcamera";;
+  esac; fi
+  sl7_lock_check libcamera libcamera libcamera-ipa libcamera-tools
   [ -f /usr/share/libcamera/ipa/simple/ov02c10.yaml ] && echo "  tuning: ov02c10.yaml present ($(grep -c 'flickerPeriod\|temporalStrength' /usr/share/libcamera/ipa/simple/ov02c10.yaml) of 2 recent keys)" || echo "  tuning: ov02c10.yaml MISSING"
   # sl7-suspend-log.sh writes a synced "pre" line before every suspend and a "post" line after it:
   # a "pre" that is followed by another "pre", or by nothing, is a suspend that never resumed.
@@ -354,6 +383,7 @@ cmd_status() {
       *sl7*) echo "  vte (GTK4 terminals): $(rpm -q vte291-gtk4), touchpad scroll patch";;
       *) echo "  vte (GTK4 terminals): $(rpm -q vte291-gtk4), distribution build (touchpad scrolls TUI programs one line per pixel; optional: sudo ./install.sh vte)";;
     esac
+    sl7_lock_check vte vte291 vte291-gtk4 vte-profile
   fi
 }
 
