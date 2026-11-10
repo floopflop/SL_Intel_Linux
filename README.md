@@ -60,10 +60,8 @@ Not fixed:
 - **A suspend can fail to resume**: lid opened, black screen, only a hard reset helps. linux-surface
   issue #2263 tracks an intermittent hang of this kind on this model; its reporter measured it on 52%
   of suspends with kernel 6.19.8 and on none of 12 with 7.2.13, and has withdrawn the SAM UART
-  interrupt storm as its cause. With Fedora's 7.2.14 and 7.2.15 it happened once in 49 suspends on one
-  of the two laptops here, and that suspend was the only one entered after a Thunderbolt dock had been
-  plugged into the running laptop. Whether the dock is the cause is not established (Troubleshooting,
-  last entry).
+  interrupt storm as its cause. Troubleshooting, last entry, shows how to tell such a hang from an
+  empty battery and how to count them.
 - **Sleep is neither deep nor quiet**: s2idle costs 1.5 to 2 W, a fifth to a quarter of the battery in
   eight hours, and for stretches of the night the laptop wakes by itself every half hour or so with
   the lid closed and goes back to sleep 25 s later. The cause of neither is known;
@@ -211,12 +209,6 @@ rebuilt the modules and the version lock kept libcamera).
   the part of it the SoC spent in its deep idle state (`s0ix`), the battery, the wake interrupt
   (`irq`) and the wakeup sources and ACPI GPEs that fired meanwhile (`fired`); `pre` has the battery,
   the number of Thunderbolt devices (`tb`) and the network interfaces with their drivers (`net`).
-  The one hang seen so far followed plugging an HP Thunderbolt 4 dock into the running laptop: the
-  dock's Intel I226 network controller then appears, `igc` binds to it and it drops out within three
-  seconds (`igc ... PCIe link lost, device now detached` in the kernel log, an `igc` interface in
-  `net`). With the dock attached at boot the controller does not appear at all, and suspends in that
-  state have all resumed. If that is your case, boot with the dock attached or unplug it before
-  closing the lid.
 
 ## Diagnostics
 

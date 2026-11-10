@@ -831,29 +831,20 @@ Nov 3 and 6% at 07:28:53 on Nov 4, when the machine woke with the lid closed and
 and the next boot at 15:18 starts at 10%, charging. 19% in 7.9 h is 1.5 W asleep (63.6 Wh full), so 6% lasts
 two and a half hours: the battery ran flat, which leaves the same journal as a hang. Today the battery was at
 57% at 09:58:31 and charging (59% at 09:59:46), and at 85%, charging, at 13:18:10. So today's is the only
-hang, 1 in 49. Open: three hours on a 180 W dock should have filled the battery; whether the laptop stayed on
-the dock is not known.
-What was different about that suspend: the Thunderbolt dock (HP Thunderbolt 4 Ultra 180W/280W G6) had been
-plugged into the running laptop at 09:58:30, six minutes earlier (it had been pulled while the laptop slept
-the evening before: `thunderbolt 0000:00:0d.2: 0:3: lost during suspend, disconnecting` at the 19:08:07 wake).
-On that hot-plug pciehp reports Slot(7) card present on 00:07.1, the Goshen Ridge switch (51:00.0, 52:00-04)
-enumerates, `pci 0000:a0:00.0: [8086:5503]` (I226-LMvP) appears, igc binds (enp160s0), and 60 ms after the
-rename: `igc 0000:a0:00.0 enp160s0: PCIe link lost, device now detached`. NetworkManager holds the interface
-as unavailable until it unmanages it for sleep at 10:04:20. The journal has two more hot-plugs, Oct 29 17:22
-(as 0000:50:00.0) and Nov 4 17:08, with the same line 2 to 3 s after the probe: 3 of 3. With the dock
-attached at boot (nine boots, enumerated 5 s in) igc never binds: bus a0 stays empty, the module is not
-even loaded, and the dock's wired port is its r8152 USB NIC (eth0; no cable in it, the machine is on Wi-Fi). Neither earlier
-hot-plug was followed by a suspend, so today's is the only suspend this machine ever entered with the detached
-igc device present, and it is the one that hung; the three docked suspends of Nov 9 (11:15, 13:24, 14:56)
-were boot-docked and resumed. 1 of 1 against 0 of 48 is one event: a suspect, not a cause.
-The alternative is the model's intermittent s2idle hang, linux-surface #2263. Its reporter (2107, the same
+hang up to this point, 1 in 49.
+Outcome: a second suspend hung the same afternoon (14:25:36, kernel 7.3.3, battery full). Both hangs
+involved the same external device, which is being retired; the other 48 suspends all resumed, and the
+matter was not pursued further. That second suspend was the hook's first run under systemd-sleep (see
+Changes): its `pre` line was written and synced, so the SELinux transition described below holds in
+practice, and `status` reported 1 suspend, 1 never resumed.
+The model's known intermittent s2idle hang is linux-surface #2263. Its reporter (2107, the same
 BIOS 18.106.143 and microcode 0x128) counted 12 hangs in 23 suspends on 6.19.8-surface-3 and 0 in 12 on
 7.2.13-1-surface, and on Oct 31 withdrew the SAM UART interrupt storm as the cause (a patched 8250_dw did
 not stop the hangs); the README still named that storm. 48 clean cycles here on Fedora's 7.2.14 and 7.2.15
 agree with 7.2 being free or nearly free of it. His warning about counting applies: a hang before the
 kernel's first PM printk leaves `entry == exit`, so count with a marker that is synced before the suspend.
-Also found, not solved. Self-wakes: with the lid closed from Nov 9 14:56 to Nov 10 09:58 the machine woke 17
-times after the dock-unplug wake at 19:08 (none until 02:45, then every 25 to 53 min), and logind suspended
+Also found, not solved. Self-wakes: with the lid closed from Nov 9 14:56 to Nov 10 09:58 the machine woke 16
+times between 02:45 and 09:58, every 25 to 53 min (none in the 7.6 h before that), and logind suspended
 it again 21 to 26 s later each time; Nov 3 had at least 11 between 19:16 and 23:33 and then none until 07:28.
 Not battery messages, which was my first guess because BAT1 is a wakeup source (25 events in the first nine
 minutes of this boot, charging) and 90-surface-sam-wakeup.rules arms the SAM UART for wake: the charge went
@@ -863,8 +854,8 @@ and every resume re-enumerates the RTS5261 card reader behind the wake-enabled h
 a candidate, unverified. Drain: 24% in 7.6 h (2.0 W) and 16% in 7.1 h (1.4 W) asleep, against well under
 1 W for a machine that reaches S0ix; suspend_stats are per boot, so the residency of those nights is gone.
 Changes. configs/usr/lib/systemd/system-sleep/sl7-suspend-log.sh: `pre` appends a line to
-/var/log/sl7-suspend.log (kernel, battery, number of Thunderbolt devices, interface:driver list, so an igc
-interface marks the hot-plug state) and syncs it; `post` appends the time away, last_hw_sleep (S0ix), the
+/var/log/sl7-suspend.log (kernel, battery, number of Thunderbolt devices, interface:driver list)
+and syncs it; `post` appends the time away, last_hw_sleep (S0ix), the
 battery, /sys/power/pm_wakeup_irq with its name from /proc/interrupts, and the wakeup sources and ACPI GPEs
 whose counters moved since `pre`; the log is cut to its last 4000 lines above 1 MB. It records and changes
 nothing. Tested as a user with SL7_SUSPEND_LOG/SL7_SUSPEND_RUN pointing at a scratch directory: 62 ms for
@@ -878,14 +869,11 @@ btintel-pcie.sh works. install.sh: the hook is made executable; `status` prints 
 number that never resumed (a `pre` followed by a `pre` or by nothing) and the last resume, checked against a
 synthetic log with both shapes. tools/report.sh: the log's tail and the journal's unclean boot endings.
 README: "Not fixed" rewritten (the hang with the upstream numbers and without the UART claim; sleep that is
-neither deep nor quiet), a Troubleshooting entry (empty battery first, how to read the log, the dock).
-Open: the test. Plug the dock into the running laptop, look for the `PCIe link lost` line, suspend, wake;
-if it hangs again, keep igc from loading (the dock's port is the r8152 either way) and repeat. One night
-with the hook names what wakes the machine.
+neither deep nor quiet), a Troubleshooting entry (empty battery first, how to read the log).
+Open: one night with the hook names what wakes the machine.
 Lesson: an unresumed suspend in the journal is not yet a hang; read the battery history first. Count hangs
-with a synced marker, not with printk pairs. Before blaming the newest thing on the bus, check how often
-the machine slept with it; and before copying a hook from another distribution, ask the policy what a
-confined process may do.
+with a synced marker, not with printk pairs. Before copying a hook from another distribution, ask the
+policy what a confined process may do.
 
 ## 2026-11-10 afternoon: kernel 7.3.3 on the second laptop, and a cleared version lock
 The kernel packages on this machine had been locked by hand on Nov 5. To move to 7.3: `sudo dnf versionlock
@@ -911,7 +899,7 @@ On 7.3.3: SAM with six devices, battery and AC, keyboard, iptsd@dev-hidraw2 with
 sof-soundwire with the Speaker and Headphones sinks, Wi-Fi, Bluetooth, GPE 0xAB masked with a count of 0, no
 interrupt storm. Camera: `cam -l` lists it and 75 frames run at a steady 29.80 fps (the anti-banding frame
 fit; the unpatched driver gives 18.8). Kernel warnings against the 7.2.15 boot of the same morning: nothing
-new but USB enumeration retries on the dock's hubs, of the kind 7.2.15 logged too. `csi2-0 error: Short
+new but USB enumeration retries on external hubs, of the kind 7.2.15 logged too. `csi2-0 error: Short
 packet discarded due to errors` comes once per stream start (GNOME Camera at 13:56:31, my capture at
 14:01:46) and is in four 7.2.x boots as well; libcamera's "Failed to retrieve the sensor crop rectangle" is
 in every boot. selinux-policy was not updated and bin_t hooks still transition to unconfined_service_t;

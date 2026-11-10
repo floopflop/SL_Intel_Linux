@@ -11,7 +11,7 @@
 #       state (s0ix; a small share means a high drain), the battery, and what woke it: the wake
 #       interrupt (irq) and the wakeup sources and ACPI GPEs that fired meanwhile (fired).
 # The pre line also lists the Thunderbolt devices (tb) and the network interfaces with their
-# drivers (net): the one hang seen so far followed a dock hot-plug that left a dead igc device.
+# drivers (net), as context for a suspend that does not come back.
 # `./install.sh status` summarises the log; README, Troubleshooting, explains the fields.
 #
 # SELinux (Fedora): systemd-sleep runs in systemd_sleep_t, which may not create or open files in
@@ -36,7 +36,7 @@ bat() {   # charge and state of the system battery, e.g. 87%/Charging
   printf '?'
 }
 
-tb() {    # Thunderbolt/USB4 devices behind the host router (0-3 is a dock; 0-0:3.1 is a retimer)
+tb() {    # Thunderbolt/USB4 devices behind the host router (0-3 is a device; 0-0:3.1 is a retimer)
   c=0
   for d in /sys/bus/thunderbolt/devices/[0-9]*-[1-9]*; do
     [ -e "$d" ] || continue
