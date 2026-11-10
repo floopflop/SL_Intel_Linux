@@ -4,7 +4,7 @@ Based on nierdal's bring-up work [here](https://github.com/linux-surface/linux-s
 
 Fixes for the Surface Laptop for Business 7th Edition with Intel (Lunar Lake, ACPI id MSHW0551,
 model 2107) on a stock distribution kernel. Developed and tested on Fedora 44 with kernel 7.2.x and
-upgraded in place to Fedora 45;
+upgraded in place to Fedora 45, where it also runs on kernel 7.3.3;
 the kernel part fetches the sources for whatever kernel you run and should work on any
 distribution with 7.2 or newer. One command installs everything:
 
