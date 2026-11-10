@@ -812,3 +812,77 @@ scrolled windows move 2.5 lines per line of travel. The Ptyxis-only drop-in now 
 CLAUDE_CODE_SCROLL_SPEED=3 (acceleration still off); with sane event counts the knob finally does what it says.
 Lesson: fix the event source, not the consumer; and never match RPM files with `name-*`, the sub-packages share
 the prefix.
+
+## 2026-11-10: second laptop did not come back from a lid-close suspend (hard reset)
+Report: closed the lid, the laptop never recovered, hard reset. Journal of that boot (Nov 9 10:04 to
+Nov 10 10:04, 7.2.15-300.fc45): `Lid closed` 10:04:20.614, `PM: suspend entry (s2idle)` 10:04:21.927,
+`Filesystems sync: 0.018 seconds` 10:04:21.942, end. Next boot 13:18:04. That says nothing about where it
+died: journald is frozen right after the sync, so everything the kernel prints during a cycle (freezing,
+device suspend, resume) is written only after a successful resume, as the twenty good cycles of the same
+boot show. No crash record is possible either: no pstore backend is registered
+(/sys/module/pstore/parameters/backend is "(null)") and this firmware has no BERT table (the upstream
+reporter's 2107 unit has one and found PMC crashlog records in it).
+History on this machine: 50 `PM: suspend entry` in the journal since Oct 29 (boots of Nov 2, Nov 2-4, Nov 6
+and Nov 9-10; kernels 7.2.14-200.fc44 and 7.2.15-300.fc45), 48 `suspend exit`, no aborted suspend. Of 17
+finished boots, 15 end with "Journal stopped" and two end at a suspend entry: Nov 4 07:29:17 and today.
+Nov 4 was not a hang, although I first counted it as one: UPower's history (GetHistory on the battery's
+D-Bus object, readable without root, about a week deep; /var/lib/upower is root-only) has 25% at 23:19 on
+Nov 3 and 6% at 07:28:53 on Nov 4, when the machine woke with the lid closed and re-suspended 24 s later,
+and the next boot at 15:18 starts at 10%, charging. 19% in 7.9 h is 1.5 W asleep (63.6 Wh full), so 6% lasts
+two and a half hours: the battery ran flat, which leaves the same journal as a hang. Today the battery was at
+57% at 09:58:31 and charging (59% at 09:59:46), and at 85%, charging, at 13:18:10. So today's is the only
+hang, 1 in 49. Open: three hours on a 180 W dock should have filled the battery; whether the laptop stayed on
+the dock is not known.
+What was different about that suspend: the Thunderbolt dock (HP Thunderbolt 4 Ultra 180W/280W G6) had been
+plugged into the running laptop at 09:58:30, six minutes earlier (it had been pulled while the laptop slept
+the evening before: `thunderbolt 0000:00:0d.2: 0:3: lost during suspend, disconnecting` at the 19:08:07 wake).
+On that hot-plug pciehp reports Slot(7) card present on 00:07.1, the Goshen Ridge switch (51:00.0, 52:00-04)
+enumerates, `pci 0000:a0:00.0: [8086:5503]` (I226-LMvP) appears, igc binds (enp160s0), and 60 ms after the
+rename: `igc 0000:a0:00.0 enp160s0: PCIe link lost, device now detached`. NetworkManager holds the interface
+as unavailable until it unmanages it for sleep at 10:04:20. The journal has two more hot-plugs, Oct 29 17:22
+(as 0000:50:00.0) and Nov 4 17:08, with the same line 2 to 3 s after the probe: 3 of 3. With the dock
+attached at boot (nine boots, enumerated 5 s in) igc never binds: bus a0 stays empty, the module is not
+even loaded, and the dock's wired port is its r8152 USB NIC (eth0; no cable in it, the machine is on Wi-Fi). Neither earlier
+hot-plug was followed by a suspend, so today's is the only suspend this machine ever entered with the detached
+igc device present, and it is the one that hung; the three docked suspends of Nov 9 (11:15, 13:24, 14:56)
+were boot-docked and resumed. 1 of 1 against 0 of 48 is one event: a suspect, not a cause.
+The alternative is the model's intermittent s2idle hang, linux-surface #2263. Its reporter (2107, the same
+BIOS 18.106.143 and microcode 0x128) counted 12 hangs in 23 suspends on 6.19.8-surface-3 and 0 in 12 on
+7.2.13-1-surface, and on Oct 31 withdrew the SAM UART interrupt storm as the cause (a patched 8250_dw did
+not stop the hangs); the README still named that storm. 48 clean cycles here on Fedora's 7.2.14 and 7.2.15
+agree with 7.2 being free or nearly free of it. His warning about counting applies: a hang before the
+kernel's first PM printk leaves `entry == exit`, so count with a marker that is synced before the suspend.
+Also found, not solved. Self-wakes: with the lid closed from Nov 9 14:56 to Nov 10 09:58 the machine woke 17
+times after the dock-unplug wake at 19:08 (none until 02:45, then every 25 to 53 min), and logind suspended
+it again 21 to 26 s later each time; Nov 3 had at least 11 between 19:16 and 23:33 and then none until 07:28.
+Not battery messages, which was my first guess because BAT1 is a wakeup source (25 events in the first nine
+minutes of this boot, charging) and 90-surface-sam-wakeup.rules arms the SAM UART for wake: the charge went
+98% -> 74% between 19:08 and 02:45 without one wake. Every cycle spends 2.85 to 3.06 s in device suspend,
+and every resume re-enumerates the RTS5261 card reader behind the wake-enabled hotplug port 00:1c.4
+(`retraining failed`, `Card not present`, `Card present`, `PM: parent 0000:00:1c.4 should not be sleeping`);
+a candidate, unverified. Drain: 24% in 7.6 h (2.0 W) and 16% in 7.1 h (1.4 W) asleep, against well under
+1 W for a machine that reaches S0ix; suspend_stats are per boot, so the residency of those nights is gone.
+Changes. configs/usr/lib/systemd/system-sleep/sl7-suspend-log.sh: `pre` appends a line to
+/var/log/sl7-suspend.log (kernel, battery, number of Thunderbolt devices, interface:driver list, so an igc
+interface marks the hot-plug state) and syncs it; `post` appends the time away, last_hw_sleep (S0ix), the
+battery, /sys/power/pm_wakeup_irq with its name from /proc/interrupts, and the wakeup sources and ACPI GPEs
+whose counters moved since `pre`; the log is cut to its last 4000 lines above 1 MB. It records and changes
+nothing. Tested as a user with SL7_SUSPEND_LOG/SL7_SUSPEND_RUN pointing at a scratch directory: 62 ms for
+`pre`, 55 ms for `post`, a `post` without a `pre` prints `fired=?`, state files removed. Not yet run by
+systemd-sleep on a real suspend. Whether it may write the log there was the question: the upstream hook
+writes /var/log on Ubuntu, and on Fedora systemd_sleep_t may neither create nor open var_log_t files (only
+append to an inherited descriptor). Queried in the binary policy with python3-setools (TERuleQuery, no root
+needed): `type_transition systemd_sleep_t bin_t:process unconfined_service_t`, so a hook labelled bin_t,
+which install(1) gives it in that directory, runs unconfined; that is also why the modprobe in
+btintel-pcie.sh works. install.sh: the hook is made executable; `status` prints the number of suspends, the
+number that never resumed (a `pre` followed by a `pre` or by nothing) and the last resume, checked against a
+synthetic log with both shapes. tools/report.sh: the log's tail and the journal's unclean boot endings.
+README: "Not fixed" rewritten (the hang with the upstream numbers and without the UART claim; sleep that is
+neither deep nor quiet), a Troubleshooting entry (empty battery first, how to read the log, the dock).
+Open: the test. Plug the dock into the running laptop, look for the `PCIe link lost` line, suspend, wake;
+if it hangs again, keep igc from loading (the dock's port is the r8152 either way) and repeat. One night
+with the hook names what wakes the machine.
+Lesson: an unresumed suspend in the journal is not yet a hang; read the battery history first. Count hangs
+with a synced marker, not with printk pairs. Before blaming the newest thing on the bus, check how often
+the machine slept with it; and before copying a hook from another distribution, ask the policy what a
+confined process may do.

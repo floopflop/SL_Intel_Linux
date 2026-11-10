@@ -67,7 +67,7 @@ enable_dkms_fallback() {
 install_config_files() {
   echo "== config files =="
   (cd "$D/configs" && find . -type f | while read -r f; do install -D -m 644 "${f#./}" "/${f#./}"; done)
-  chmod 755 /usr/lib/systemd/system-sleep/btintel-pcie.sh
+  chmod 755 /usr/lib/systemd/system-sleep/btintel-pcie.sh /usr/lib/systemd/system-sleep/sl7-suspend-log.sh   # systemd-sleep runs executables only
 }
 # Fedora's dkms rebuilds every initramfs after each transaction (framework.conf: post_transaction="dracut ...").
 dkms_regenerates_initramfs() { grep -qsE '^post_transaction=.*(dracut|initramfs|mkinitcpio)' /etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf; }
@@ -338,6 +338,17 @@ cmd_status() {
   fi
   printf '  libcamera: %s\n' "$(rpm -q libcamera 2>/dev/null || cam --version 2>/dev/null | head -1 || echo unknown)"
   [ -f /usr/share/libcamera/ipa/simple/ov02c10.yaml ] && echo "  tuning: ov02c10.yaml present ($(grep -c 'flickerPeriod\|temporalStrength' /usr/share/libcamera/ipa/simple/ov02c10.yaml) of 2 recent keys)" || echo "  tuning: ov02c10.yaml MISSING"
+  # sl7-suspend-log.sh writes a synced "pre" line before every suspend and a "post" line after it:
+  # a "pre" that is followed by another "pre", or by nothing, is a suspend that never resumed.
+  local sl=/var/log/sl7-suspend.log
+  if [ -r "$sl" ]; then
+    awk '$2 == "pre"  { n++; if (open) { lost++; when = t }; open = 1; t = $1 }
+         $2 == "post" { open = 0; last = $0; sub(/^[^ ]+ post [^ ]+ /, "", last) }
+         END { if (open) { lost++; when = t }
+               printf "  suspend log: %d suspends, %d never resumed%s\n", n, lost, (lost ? " (last one entered " when "; a hang, or the battery ran flat: README, Troubleshooting)" : "")
+               if (last != "") print "  last resume: " last }' "$sl"
+  elif [ -x /usr/lib/systemd/system-sleep/sl7-suspend-log.sh ]; then echo "  suspend log: hook installed, no suspend recorded yet"
+  else echo "  suspend log: hook not installed (sudo ./install.sh configs)"; fi
   if command -v rpm >/dev/null && rpm -q vte291-gtk4 >/dev/null 2>&1; then
     case "$(rpm -q --qf '%{RELEASE}' vte291-gtk4)" in
       *sl7*) echo "  vte (GTK4 terminals): $(rpm -q vte291-gtk4), touchpad scroll patch";;

@@ -55,7 +55,19 @@ Ptyxis and GNOME Console) with a one-hunk patch so that two-finger scrolling ins
 the mouse (less, vim, htop, Claude Code's fullscreen UI) moves one wheel click per text line of finger
 travel instead of one per pixel (VTE issue 2720, open). See "Terminal scrolling" below.
 
-Not fixed: the SAM UART interrupt storm that can hang suspend (linux-surface issue #2263).
+Not fixed:
+
+- **A suspend can fail to resume**: lid opened, black screen, only a hard reset helps. linux-surface
+  issue #2263 tracks an intermittent hang of this kind on this model; its reporter measured it on 52%
+  of suspends with kernel 6.19.8 and on none of 12 with 7.2.13, and has withdrawn the SAM UART
+  interrupt storm as its cause. With Fedora's 7.2.14 and 7.2.15 it happened once in 49 suspends on one
+  of the two laptops here, and that suspend was the only one entered after a Thunderbolt dock had been
+  plugged into the running laptop. Whether the dock is the cause is not established (Troubleshooting,
+  last entry).
+- **Sleep is neither deep nor quiet**: s2idle costs 1.5 to 2 W, a fifth to a quarter of the battery in
+  eight hours, and for stretches of the night the laptop wakes by itself every half hour or so with
+  the lid closed and goes back to sleep 25 s later. The cause of neither is known;
+  `/var/log/sl7-suspend.log` records what woke it (same entry).
 
 ## How it works
 
@@ -180,6 +192,23 @@ rebuilt the modules and the version lock kept libcamera).
   holds the key. Fedora's kernel accepts it from the platform keyring; a kernel that only consults
   the machine keyring needs the MOK certificate to be a CA certificate (`basicConstraints=CA:TRUE`,
   `keyUsage=keyCertSign`), so regenerate and re-enrol it that way.
+- **The laptop does not come back from sleep** (lid opened, black screen, hard reset). First rule out
+  an empty battery: sleep costs 1.5 to 2 W, so a laptop that went to sleep at 6% is off two and a half
+  hours later, and the journal of that boot ends at `PM: suspend entry` exactly as it does after a
+  hang; it then starts only on the charger, at a few percent. `./install.sh status` counts the
+  suspends that never resumed from `/var/log/sl7-suspend.log`, which the sleep hook
+  `sl7-suspend-log.sh` writes: a `pre` line, synced to disk, before every suspend and a `post` line
+  after it. A `pre` without a `post` never resumed, whatever the journal kept (the kernel's messages
+  of a suspend cycle are only written after a successful resume). `post` has the time away (`slept`),
+  the part of it the SoC spent in its deep idle state (`s0ix`), the battery, the wake interrupt
+  (`irq`) and the wakeup sources and ACPI GPEs that fired meanwhile (`fired`); `pre` has the battery,
+  the number of Thunderbolt devices (`tb`) and the network interfaces with their drivers (`net`).
+  The one hang seen so far followed plugging an HP Thunderbolt 4 dock into the running laptop: the
+  dock's Intel I226 network controller then appears, `igc` binds to it and it drops out within three
+  seconds (`igc ... PCIe link lost, device now detached` in the kernel log, an `igc` interface in
+  `net`). With the dock attached at boot the controller does not appear at all, and suspends in that
+  state have all resumed. If that is your case, boot with the dock attached or unplug it before
+  closing the lid.
 
 ## Diagnostics
 
@@ -196,6 +225,8 @@ Windows driver store, `ov02c10_extension.inf_amd64_*`, which this repository doe
 All camera tools run `cam` and need the camera to be free (close camera apps first).
 `tools/report.sh` (ideally as root) collects everything about an installation into one text
 file: `sudo ./tools/report.sh > report.txt`. Attach it when reporting a problem.
+`/var/log/sl7-suspend.log` has one `pre` and one `post` line per suspend (Troubleshooting, last
+entry); `uninstall.sh` removes the hook that writes it and leaves the log.
 
 ## License
 
