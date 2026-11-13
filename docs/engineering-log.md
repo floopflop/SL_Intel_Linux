@@ -1012,3 +1012,14 @@ Not looked into: the package C10 residency MSR gained 62 minutes over the same 6
 Lesson: a duration the kernel passes on as u32 microseconds is good for 71 minutes. Check a derived figure
 against an independent counter over a long interval as well as a short one; the one-minute probe sleeps
 could not have shown this.
+Confirmed the same morning, after a reboot at 08:05 with the fixed hook installed. One minute after boot the
+reader was on the bus in D0, runtime active, power/control=on, and the port had logged no link event; without
+the rule it was gone within ten seconds of being detected. Then two sleeps with the lid closed, on battery:
+08:06:53 to 09:26:47, 0.72 s in device suspend, `s0ix=4789s` of 4794; 09:27:15 to 10:47:17, 0.46 s, 4794 s
+of 4802. Both are longer than the 71.6 minutes at which the old reading wrapped. The reader was detected
+anew at the 09:26 resume (`Card not present`, `Card present`, `Link Up`, rtsx_pci probe) and was still
+active 28 s later when the machine suspended again, so the rule applies to the new device as well; a minute
+after the 10:47 resume it was again in D0 with power/control=on. The retraining messages now come only after
+`PM: suspend devices took`, on the way out of sleep. One unattended wake in the 2 h 40 min, through the SAM
+wake signal. Battery 61% before and after. Still not measured: a whole night with the reader on the bus, and
+what the reader costs in D0 while the machine is awake.
