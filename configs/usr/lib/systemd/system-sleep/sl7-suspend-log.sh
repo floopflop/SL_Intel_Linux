@@ -22,6 +22,9 @@ LOG=${SL7_SUSPEND_LOG:-/var/log/sl7-suspend.log}
 RUN=${SL7_SUSPEND_RUN:-/run}
 SNAP=$RUN/sl7-suspend.counters
 T0=$RUN/sl7-suspend.t0
+S0=$RUN/sl7-suspend.s0
+# The firmware's S0ix residency counter (LPIT), microseconds since boot, 64 bits wide.
+LPI=/sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us
 
 # first line of a file, "?" when it cannot be read (sysfs files that return ENODATA or EINVAL)
 val() { v=; { read -r v < "$1"; } 2>/dev/null; printf '%s' "${v:-?}"; }
@@ -68,6 +71,7 @@ counters() {   # "name<TAB>count" for every wakeup source and ACPI GPE that has 
 case "$1" in
   pre)
     date +%s > "$T0" 2>/dev/null
+    val "$LPI" > "$S0" 2>/dev/null
     counters > "$SNAP" 2>/dev/null
     printf '%s pre %s kern=%s bat=%s tb=%s net=%s\n' \
       "$(date -Is)" "${2:-?}" "$(uname -r)" "$(bat)" "$(tb)" "$(net)" >> "$LOG" 2>/dev/null
@@ -76,8 +80,16 @@ case "$1" in
   post)
     slept=?; t0=$(val "$T0")
     case $t0 in ''|*[!0-9]*) ;; *) slept=$(($(date +%s) - t0));; esac
-    hw=$(val /sys/power/suspend_stats/last_hw_sleep)      # microseconds in S0ix in this cycle
-    case $hw in ''|*[!0-9]*) hw=?;; *) hw=$((hw / 1000000));; esac
+    # Time in S0ix in this cycle: the LPIT counter after minus before. suspend_stats/last_hw_sleep
+    # looks like the direct figure, but intel_pmc_core reports it as 32 bits of microseconds, so it
+    # wraps every 71.6 minutes: a 6.8 h sleep that was 99.9% S0ix read as 3162 s. It is the fallback
+    # for a machine without the LPIT counter, and then only right for sleeps shorter than that.
+    hw=?; a=$(val "$S0"); b=$(val "$LPI")
+    case "$a$b" in
+      ''|*[!0-9]*) hw=$(val /sys/power/suspend_stats/last_hw_sleep)
+                   case $hw in ''|*[!0-9]*) hw=?;; *) hw=$((hw / 1000000));; esac;;
+      *) hw=$(( (b - a) / 1000000 ));;
+    esac
     irq=$(val /sys/power/pm_wakeup_irq)                   # ENODATA when the PM core saw no wake IRQ
     case $irq in ''|*[!0-9]*) irq=?;; *)
       irq="$irq($(awk -v i="$irq:" '$1 == i { for (k = 2; k <= NF; k++) if ($k !~ /^[0-9]+$/) {
@@ -93,7 +105,7 @@ case "$1" in
     fi
     printf '%s post %s slept=%ss s0ix=%ss bat=%s irq=%s fired=%s\n' \
       "$(date -Is)" "${2:-?}" "$slept" "$hw" "$(bat)" "$irq" "$fired" >> "$LOG" 2>/dev/null
-    rm -f "$SNAP" "$SNAP.now" "$T0" 2>/dev/null
+    rm -f "$SNAP" "$SNAP.now" "$T0" "$S0" 2>/dev/null
     # two lines per suspend: the kept tail is months of use
     if [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
       tail -n 4000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"

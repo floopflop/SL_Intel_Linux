@@ -987,3 +987,28 @@ the time since the last resume is a hidden variable, so hold the interval fixed 
 rest pinned. When a second machine with the same configuration behaves differently, the shared configuration
 is not the cause; ask for that comparison before proposing to change it. And read all of your own output: the
 3 s against 0.5 s was on the page.
+
+## 2026-11-13: the first night after the reader fix; the hook's s0ix figure wrapped
+`sudo ./install.sh configs` at 21:34 on Nov 12, lid closed at 21:36 on battery. UPower: 67% then, 63% at 07:56,
+4% of 63.7 Wh in 10.3 h, 0.25 W against 1.5 W the night before. Two unattended wakes (04:27, 07:25) against
+40. Every device suspend took 0.75 to 0.96 s and no retraining message appeared.
+The hook's own figure disagreed: `s0ix=3162s` of 24657 and `s0ix=2073s` of 10672 for the two long sleeps,
+13% and 19%, though 1776 of 1779 for the short one after them. The figure was wrong, not the sleep.
+/sys/power/suspend_stats/last_hw_sleep comes from intel_pmc_core, which hands the residency over as 32 bits
+of microseconds, so it wraps every 4295 s (71.6 minutes): 3162 + 5 x 4295 = 24637 and 2073 + 2 x 4295 =
+10663, 99.9% of each sleep. The firmware's LPIT counter (low_power_idle_system_residency_us, 64 bits)
+agrees: 618 minutes gained over 618 minutes asleep. The `s0ix=0s` readings before the fix stand; the LPIT
+counter was 0 then as well. sl7-suspend-log.sh now stores the LPIT counter at `pre` and reports the
+difference at `post`, and uses last_hw_sleep only where that counter is missing. Tested with the paths
+redirected: no sleep gives 0 s, the night's first sleep replayed gives 24637 s where the old code gave
+3162 s, a `post` without a `pre` and a machine without the counter fall back to the kernel's figure.
+The rule did not produce this night. The reader had left the bus at 21:22:43, after the probe's cleanup: it
+dropped its link ten seconds after being detected while its port was awake, and pciehp removed it. No resume
+since then has detected it again, and `echo 1 > /sys/bus/pci/rescan` does not bring it back either (the port
+stays in D3cold and the kernel logs nothing). So the night measures sleep without the reader's bad state,
+which is what the rule is meant to guarantee, but the rule itself has still not run on a reader. A boot
+detects the reader; that is the test.
+Not looked into: the package C10 residency MSR gained 62 minutes over the same 618.
+Lesson: a duration the kernel passes on as u32 microseconds is good for 71 minutes. Check a derived figure
+against an independent counter over a long interval as well as a short one; the one-minute probe sleeps
+could not have shown this.
