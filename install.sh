@@ -191,6 +191,11 @@ cmd_configs() {
   systemctl daemon-reload; systemctl enable iptsd-resume.service >/dev/null 2>&1 || true
   enable_dkms_fallback
   udevadm control --reload
+  # 90-surface-sl7-card-reader.rules takes effect when the reader is next detected (boot, or any
+  # resume); make the same setting now, so that the next sleep already reaches deep idle
+  local rd; for rd in /sys/bus/pci/devices/*; do
+    [ "$(cat "$rd/vendor" 2>/dev/null)" = 0x10ec ] && [ "$(cat "$rd/device" 2>/dev/null)" = 0x5261 ] && echo on > "$rd/power/control" 2>/dev/null || true
+  done
   echo "== kernel command line: acpi_mask_gpe=0xAB (SAM GPE storm) =="
   if grep -q 'acpi_mask_gpe=0xAB' /proc/cmdline; then echo "already active"
   elif command -v grubby >/dev/null; then grubby --update-kernel=ALL --args="acpi_mask_gpe=0xAB"; echo "added via grubby (active after reboot)"

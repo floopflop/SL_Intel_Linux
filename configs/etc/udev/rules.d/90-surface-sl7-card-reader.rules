@@ -1,0 +1,15 @@
+# Surface Laptop 7 15" (Intel): keep the microSD reader (Realtek RTS5261, behind root port
+# 00:1c.4) out of runtime power management, or sleep costs about 1.5 W.
+#
+# Left alone, the reader powers itself down shortly after it was last used (D3cold, PCIe link
+# dropped). When the system then suspends, the kernel wakes the reader up in order to suspend it and
+# the link does not retrain: "pcieport 0000:00:1c.4: retraining failed" and "pciehp: Slot(4): Card
+# not present" while going to sleep, 3 s in device suspend instead of 0.9 s. For the whole sleep the
+# processor package then stays in C2: no C10, no S0ix, a third of the battery in a night. With the
+# reader kept active it suspends cleanly and the package spends over 90% of the sleep in C10.
+#
+# The reader is detected anew at every resume (the port reports the card not present, then
+# present), so the setting has to be made on each new device: "add" covers a reader without a
+# driver, "bind" comes after the probe of rtsx_pci, which switches runtime power management on.
+# The 13.8" laptop here reaches deep idle without this rule.
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10ec", ATTR{device}=="0x5261", ATTR{power/control}="on"

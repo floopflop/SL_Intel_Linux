@@ -46,6 +46,7 @@ Before you start:
 | Keyboard, battery, power button dead for a whole boot | `surface_serial_hub: failed to setup IRQ`: when the SAM driver loads before the Lunar Lake pin controller (it does once it sits in the initramfs), its wake-GPIO lookup fails and the driver gives up instead of deferring | modprobe softdep loading `pinctrl_intel_platform` first | `configs/etc/modprobe.d` |
 | Camera gone after a DKMS build | dracut copies every out-of-tree module and its dependencies into the initramfs; the IPU7 driver then probes there without its firmware and never recovers | dracut omit list for the camera and audio modules | `configs/etc/dracut.conf.d` |
 | Power button does not wake | Wakeup disabled on the serial hub the keyboard sits behind | udev rule enabling wakeup | `configs/etc/udev` |
+| Battery drains while asleep (15-inch) | The microSD reader powers itself down when idle; at suspend the kernel wakes it, its PCIe link does not retrain, and the processor never reaches its deep idle state: about 1.5 W, a third of the battery in a night | udev rule keeping the reader out of runtime power management | `configs/etc/udev` |
 | Suspend aborts, Bluetooth dead | `btintel_pcie` fails to enter D2 | Unload before sleep, reload after | `configs/usr/lib/systemd/system-sleep` |
 | Interrupt storm | SAM GPE 0xAB fires continuously | `acpi_mask_gpe=0xAB` on the kernel command line | `install.sh configs` |
 | Camera pickers | 30+ raw IPU7 V4L2 nodes listed next to the real camera | WirePlumber rule hiding them | `configs/etc/wireplumber` |
@@ -62,10 +63,12 @@ Not fixed:
   of suspends with kernel 6.19.8 and on none of 12 with 7.2.13, and has withdrawn the SAM UART
   interrupt storm as its cause. Troubleshooting, last entry, shows how to tell such a hang from an
   empty battery and how to count them.
-- **Sleep is neither deep nor quiet**: s2idle costs 1.5 to 2 W, a fifth to a quarter of the battery in
-  eight hours, and for stretches of the night the laptop wakes by itself every half hour or so with
-  the lid closed and goes back to sleep 25 s later. The cause of neither is known;
-  `/var/log/sl7-suspend.log` records what woke it (same entry).
+- **Sleep is not quiet**: with the lid closed the laptop wakes by itself every 20 to 50 minutes and
+  goes back to sleep 25 s later. Every such wake comes through the embedded controller's wake signal,
+  which `90-surface-sam-wakeup.rules` arms so that the keyboard and the power button can wake the
+  laptop; they come about once per percent of charge, so its battery state messages are the likely
+  cause. With the card reader rule in place the time in between is spent in deep idle.
+  `/var/log/sl7-suspend.log` records every wake (same entry).
 
 ## How it works
 
@@ -198,10 +201,18 @@ rebuilt the modules and the version lock kept libcamera).
   (the VTE step is optional and not part of it). `sudo dnf versionlock add <names>`, as `status`
   prints it, restores a lock; `sudo ./install.sh libcamera` or `sudo ./install.sh vte` reinstalls a
   build that an update has already replaced and locks it again.
+- **The battery drains with the lid closed** and every `post` line in `/var/log/sl7-suspend.log`
+  says `s0ix=0s`: the processor never reaches its deep idle state. On the 15-inch model the cause
+  seen here is the microSD reader in runtime suspend (table above): `journalctl -kb | grep -B3
+  'suspend devices took'` then shows `pcieport 0000:00:1c.4: retraining failed` before a device
+  suspend of about 3 s, and `cat /sys/bus/pci/devices/0000:a2:00.0/power/control` says `auto` where
+  the rule sets `on`. `sudo ./install.sh configs` installs the rule and applies it at once; in
+  one-minute test sleeps the share of deep idle went from 0 to 92% and the platform power from 0.55
+  to 0.10 W. The 13.8-inch laptop here reaches deep idle without the rule.
 - **The laptop does not come back from sleep** (lid opened, black screen, hard reset). First rule out
-  an empty battery: sleep costs 1.5 to 2 W, so a laptop that went to sleep at 6% is off two and a half
-  hours later, and the journal of that boot ends at `PM: suspend entry` exactly as it does after a
-  hang; it then starts only on the charger, at a few percent. `./install.sh status` counts the
+  an empty battery: without deep idle sleep costs about 1.5 W, so a laptop that went to sleep at 6%
+  is off two and a half hours later, and the journal of that boot ends at `PM: suspend entry` exactly
+  as it does after a hang; it then starts only on the charger, at a few percent. `./install.sh status` counts the
   suspends that never resumed from `/var/log/sl7-suspend.log`, which the sleep hook
   `sl7-suspend-log.sh` writes: a `pre` line, synced to disk, before every suspend and a `post` line
   after it. A `pre` without a `post` never resumed, whatever the journal kept (the kernel's messages

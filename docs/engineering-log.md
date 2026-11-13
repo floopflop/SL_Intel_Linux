@@ -920,3 +920,70 @@ unavailable, dnf 4 output, distribution build, no rpm; and on the machine, where
 and status is unchanged. README: a Troubleshooting entry for the two messages.
 Lesson: `dnf versionlock clear` is not "unlock the kernel"; `dnf versionlock delete <names>` is. A lock
 that only an optional step restores needs something that says when it is missing.
+
+## 2026-11-12: second laptop (15") loses a third of its battery asleep: the microSD reader, not the wake rule
+Report: "lost an excessive amount of power with the lid closed again". UPower: 69% at 22:36 on Nov 11, 31% at
+14:46 on Nov 12, 38% of 63.6 Wh in 16.2 h, 1.5 W. sl7-suspend-log.sh had 58 cycles by then, 40 of them in that
+night: `s0ix=0s` in every one, and every wake `irq=14` (the pin controller) with a BAT1 event. Cross-checks
+without root: /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us was 0 after about 25 h
+asleep and low_power_idle_cpu_residency_us (package C10) 114 s. The 40 wake cycles of that night kept the
+machine awake 17 minutes in total, a tenth of the loss at most; the rest is 1.4 W of sleeping without deep idle.
+The wakes: /proc/interrupts names the line, `intel-gpio 40 ssam_wakeup`, the SAM's wake signal, which
+90-surface-sam-wakeup.rules arms. They come every 20 to 50 minutes, about once per percent of charge, and the
+battery's wakeup source counts an event in every cycle, but it does so after RTC wakes too (the EC sends the
+battery state at every resume), so "battery state messages" is the likely trigger, not a proven one. On
+Nov 10 I had ruled battery messages out because one 7.6 h stretch had no wake; that was wrong.
+What it was not, each checked: the cores (intel_idle with the ACPI states; C3_ACPI holds 97967 s of s2idle
+time per CPU, all of the sleep); graphics (gt0 and gt1 report gt-c6); PCIe ASPM (L1.2 enabled for the NVMe
+and the reader); the firmware's LPI constraints (with pm_debug_messages on, no "Constraint not met" line;
+the LPS0 _DSM sequence runs); Bluetooth and the sensor hub (driverless in D0 during sleep, the first because
+btintel-pcie.sh unloads the driver, but neither is a requirement in pmc_core's table); the two touch host
+controllers (THC0 has no driver because nothing is attached to it and intel_quicki2c's probe fails, THC1 is
+the touchpad; both show as "not D3" in s0ix_blocker, and parking THC0 in D3hot through vfio-pci clears its
+row, but the measured sleep power did not move: 0.10 against 0.11 W).
+pmc_core, for the next time: package_cstate_show before and after a sleep is the first thing to read; here
+the package sat in C2 for 70 of 72 s, so S0ix was never even attempted, and substate_requirements and the
+latched status say nothing useful in that case. The s0ix_blocker counters only run while the package is in
+C10, at about 32.8 kHz (27302 in 0.8 s of C10 awake, 0 in a sleep without C10, 2.44 million in 74 s): a
+cumulative reading mostly describes the awake moments. Under Secure Boot lockdown the read-only debugfs
+files remain readable by root; lpm_latch_mode and ltr_ignore are not.
+The wrong turn. A probe with four RTC-timed sleeps, each adding a change, gave: as-is 0% C10, then with
+both wake attributes of the SAM rule disabled 86% C10 and 41.6 s of S0ix in 48.6 s, and 91% in the two after
+it. I told the user the wake rule was the cause and suggested switching it off. They wanted to keep waking the
+laptop with the keyboard, and reported that their 13.8" laptop, with the same repository installed, does not
+drain; its counter read 296667 s of S0ix with both attributes enabled. So the rule could not be it. The
+probe had changed something else between its first sleep and the others without my noticing: the first
+started after minutes awake, the others 5 to 8 s after a resume. The device-suspend times in my own output
+said so (3.0 s, then 0.46, 0.74, 1.0 s) and I had read past them.
+The cause: the microSD reader of the 15" (Realtek RTS5261, 0000:a2:00.0 behind the hotplug-capable root port
+00:1c.4). With runtime power management on it powers down about 10 s after it is detected and drops its
+link. When the port goes down with it, the reader stays listed in D3cold; at system suspend the kernel
+resumes port and reader to suspend them, and the link does not come back: `removing 2.5GT/s downstream link
+speed restriction`, `retraining failed`, `Data Link Layer Link Active not set in 100 msec`, `pciehp: Slot(4):
+Card not present`, all before `PM: suspend devices took 2.9 seconds` (rtsx_pci's pci_pm_suspend alone takes
+2.2 s under pm_print_times). The package then stays in C2 for the whole sleep. All 58 suspends of the Nov 11
+boot took that path. When the port is still awake as the link drops, pciehp removes the reader from the bus
+instead, and a suspend in that state is clean. At every resume the port reports the card not present and
+then present, and the reader is enumerated anew.
+The test that varied only the reader, wake rule enabled throughout, on battery, 60 s sleeps:
+as-is after the reader had powered down: 2.97 s device suspend, 91% C2, 0 s S0ix, 0.55 W (RAPL psys);
+reader kept active (power/control=on): 0.91 s, 92% C10, 58.8 of 63.8 s S0ix, 0.10 W;
+rtsx_pci unloaded: 0.91 s, 92% C10, 31.2 of 33.9 s (ended early by a SAM wake), 0.11 W;
+reader removed from the bus: 0.89 s, 96% C10, 58.6 of 61.4 s, 0.07 W.
+The psys figures are RAPL over a minute including the seconds awake at both ends; the battery's own figure
+for a night is still to come.
+Fix: configs/etc/udev/rules.d/90-surface-sl7-card-reader.rules sets power/control=on for 10ec:5261 on `add`
+and on `bind`. Both, because the reader is a new device after every resume and rtsx_pci's probe allows
+runtime power management after the add event. `udevadm verify` passes; `install.sh configs` makes the same
+setting at once for a reader that is on the bus. Keeping the reader active was chosen over unloading the
+driver (same result, and the slot keeps working) and over removing the device (best figure, but it returns
+at the next resume). Cost not measured: the reader stays in D0 while the machine is awake. Not yet seen: the
+rule applying by itself across a night of resumes; the probe made the setting by hand for one sleep.
+The wake rule stays as it is. README: a row in the table, a Troubleshooting entry (`s0ix=0s` in every post
+line, how to recognise the reader), "Sleep is neither deep nor quiet" reduced to the wakes. The probes were
+scratch scripts and are not in the repository.
+Lesson: consecutive test cycles differ in more than the setting changed between them; whatever decays with
+the time since the last resume is a hidden variable, so hold the interval fixed or vary one thing with the
+rest pinned. When a second machine with the same configuration behaves differently, the shared configuration
+is not the cause; ask for that comparison before proposing to change it. And read all of your own output: the
+3 s against 0.5 s was on the page.
