@@ -46,7 +46,7 @@ Before you start:
 | Keyboard, battery, power button dead for a whole boot | `surface_serial_hub: failed to setup IRQ`: when the SAM driver loads before the Lunar Lake pin controller (it does once it sits in the initramfs), its wake-GPIO lookup fails and the driver gives up instead of deferring | modprobe softdep loading `pinctrl_intel_platform` first | `configs/etc/modprobe.d` |
 | Camera gone after a DKMS build | dracut copies every out-of-tree module and its dependencies into the initramfs; the IPU7 driver then probes there without its firmware and never recovers | dracut omit list for the camera and audio modules | `configs/etc/dracut.conf.d` |
 | Power button does not wake | Wakeup disabled on the serial hub the keyboard sits behind | udev rule enabling wakeup | `configs/etc/udev` |
-| Battery drains while asleep (15-inch) | The microSD reader powers itself down when idle; at suspend the kernel wakes it, its PCIe link does not retrain, and the processor never reaches its deep idle state: about 1.5 W, a third of the battery in a night | udev rule keeping the reader out of runtime power management | `configs/etc/udev` |
+| Battery drains while asleep (15-inch) | The microSD reader powers itself down when idle; at suspend the kernel wakes it, its PCIe link does not retrain, and the processor never reaches its deep idle state: about 1.5 W, a third of the battery in a night | Sleep hook that wakes the reader just before each suspend (keeping it awake all the time fixes sleep too, but costs 1 W while the laptop is on) | `configs/usr/lib/systemd/system-sleep` |
 | Suspend aborts, Bluetooth dead | `btintel_pcie` fails to enter D2 | Unload before sleep, reload after | `configs/usr/lib/systemd/system-sleep` |
 | Interrupt storm | SAM GPE 0xAB fires continuously | `acpi_mask_gpe=0xAB` on the kernel command line | `install.sh configs` |
 | Camera pickers | 30+ raw IPU7 V4L2 nodes listed next to the real camera | WirePlumber rule hiding them | `configs/etc/wireplumber` |
@@ -67,7 +67,7 @@ Not fixed:
   goes back to sleep 25 s later. Every such wake comes through the embedded controller's wake signal,
   which `90-surface-sam-wakeup.rules` arms so that the keyboard and the power button can wake the
   laptop; they come about once per percent of charge, so its battery state messages are the likely
-  cause. With the card reader rule in place the time in between is spent in deep idle.
+  cause. With the card reader hook in place the time in between is spent in deep idle.
   `/var/log/sl7-suspend.log` records every wake (same entry).
 
 ## How it works
@@ -203,12 +203,15 @@ rebuilt the modules and the version lock kept libcamera).
   build that an update has already replaced and locks it again.
 - **The battery drains with the lid closed** and every `post` line in `/var/log/sl7-suspend.log`
   says `s0ix=0s`: the processor never reaches its deep idle state. On the 15-inch model the cause
-  seen here is the microSD reader in runtime suspend (table above): `journalctl -kb | grep -B3
-  'suspend devices took'` then shows `pcieport 0000:00:1c.4: retraining failed` before a device
-  suspend of about 3 s, and `cat /sys/bus/pci/devices/0000:a2:00.0/power/control` says `auto` where
-  the rule sets `on`. `sudo ./install.sh configs` installs the rule and applies it at once; in
-  one-minute test sleeps the share of deep idle went from 0 to 92% and the platform power from 0.55
-  to 0.10 W. The 13.8-inch laptop here reaches deep idle without the rule.
+  seen here is the microSD reader, powered down by runtime power management when the suspend starts
+  (table above): `journalctl -kb | grep -B3 'suspend devices took'` then shows `pcieport
+  0000:00:1c.4: retraining failed` before a device suspend of about 3 s. The sleep hook
+  `sl7-card-reader.sh` wakes the reader first, so that it is active when the suspend starts and
+  goes down cleanly; `sudo ./install.sh configs` installs it. With the reader active at suspend the
+  share of deep idle went from 0 to over 99% of a sleep. Do not simply keep the reader awake
+  (`power/control` set to `on`): that fixes sleep as well, but an idle laptop then draws 2.85 W
+  where it drew 1.8 W, because the processor cannot idle deeply while awake either. The 13.8-inch
+  laptop here reaches deep idle without any of this.
 - **The laptop does not come back from sleep** (lid opened, black screen, hard reset). First rule out
   an empty battery: without deep idle sleep costs about 1.5 W, so a laptop that went to sleep at 6%
   is off two and a half hours later, and the journal of that boot ends at `PM: suspend entry` exactly

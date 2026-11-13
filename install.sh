@@ -67,7 +67,8 @@ enable_dkms_fallback() {
 install_config_files() {
   echo "== config files =="
   (cd "$D/configs" && find . -type f | while read -r f; do install -D -m 644 "${f#./}" "/${f#./}"; done)
-  chmod 755 /usr/lib/systemd/system-sleep/btintel-pcie.sh /usr/lib/systemd/system-sleep/sl7-suspend-log.sh   # systemd-sleep runs executables only
+  chmod 755 /usr/lib/systemd/system-sleep/btintel-pcie.sh /usr/lib/systemd/system-sleep/sl7-suspend-log.sh \
+            /usr/lib/systemd/system-sleep/sl7-card-reader.sh   # systemd-sleep runs executables only
 }
 # Fedora's dkms rebuilds every initramfs after each transaction (framework.conf: post_transaction="dracut ...").
 dkms_regenerates_initramfs() { grep -qsE '^post_transaction=.*(dracut|initramfs|mkinitcpio)' /etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf; }
@@ -190,11 +191,14 @@ cmd_configs() {
   install_config_files
   systemctl daemon-reload; systemctl enable iptsd-resume.service >/dev/null 2>&1 || true
   enable_dkms_fallback
+  # The 15" model's card reader is woken before each suspend by the sleep hook sl7-card-reader.sh.
+  # The udev rule that kept it active all the time (installed 2026-11-12) fixed sleep but cost 1 W
+  # while awake: remove an installed copy (the initramfs rebuilt below loses its copy too) and hand
+  # a reader that the rule left "on" back to runtime power management.
+  rm -f /etc/udev/rules.d/90-surface-sl7-card-reader.rules
   udevadm control --reload
-  # 90-surface-sl7-card-reader.rules takes effect when the reader is next detected (boot, or any
-  # resume); make the same setting now, so that the next sleep already reaches deep idle
   local rd; for rd in /sys/bus/pci/devices/*; do
-    [ "$(cat "$rd/vendor" 2>/dev/null)" = 0x10ec ] && [ "$(cat "$rd/device" 2>/dev/null)" = 0x5261 ] && echo on > "$rd/power/control" 2>/dev/null || true
+    [ "$(cat "$rd/vendor" 2>/dev/null)" = 0x10ec ] && [ "$(cat "$rd/device" 2>/dev/null)" = 0x5261 ] && echo auto > "$rd/power/control" 2>/dev/null || true
   done
   echo "== kernel command line: acpi_mask_gpe=0xAB (SAM GPE storm) =="
   if grep -q 'acpi_mask_gpe=0xAB' /proc/cmdline; then echo "already active"

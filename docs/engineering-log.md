@@ -1023,3 +1023,40 @@ after the 10:47 resume it was again in D0 with power/control=on. The retraining 
 `PM: suspend devices took`, on the way out of sleep. One unattended wake in the 2 h 40 min, through the SAM
 wake signal. Battery 61% before and after. Still not measured: a whole night with the reader on the bus, and
 what the reader costs in D0 while the machine is awake.
+
+## 2026-11-13 afternoon: the reader kept on costs 1 W awake; a sleep hook replaces the udev rule
+Asked what keeping the reader active costs while the machine is awake. I had guessed tens of milliwatts and
+written "cost not measured" in the log. Measured on battery, lid open, screen on at the same brightness,
+idle inhibitor held, nobody touching the machine; four phases of 45 s settling and 120 s of the battery's
+power reading (BAT1 power_now, a slow average, 60 samples each), with RAPL and the package C-state counters
+across the same window:
+reader on, first:      2.866 W battery, 1.655 W psys, package C2 36%, no C10;
+reader down, first:    1.791 W, 0.543 W psys, package C10 36%;
+reader on, second:     2.832 W, 1.643 W psys, package C2 40%, no C10;
+reader down, second:   1.828 W, 0.584 W psys, package C10 30%.
+The repeats agree to 0.04 W; the difference is 1.04 W, 57% on top of an idle machine. The reader does not
+draw a watt itself: with it in D0 (ASPM L1, L1.1 and L1.2 all reported enabled) the package never enters
+C10 while awake either, the same block as in sleep. So 90-surface-sl7-card-reader.rules, committed the day
+before, bought a deep sleep with 1 W of every idle hour awake. "Down" in these phases was the listed-D3cold
+state, the one that breaks a suspend.
+Switching the reader back on from that state takes 1.2 s and goes the way a resume does: `broken device,
+retraining non-functional downstream link at 2.5GT/s`, `retraining failed` a second later, `Card not
+present`, `Card present`, `Link Up`, the reader enumerated anew, rtsx_pci probed.
+The user chose to keep the slot working over removing the reader from the bus on detection (one line, best
+sleep figure, slot dead; no card has been used in this machine since Oct 29). So: the udev rule is removed,
+and a sleep hook, configs/usr/lib/systemd/system-sleep/sl7-card-reader.sh, does at `pre` what the rule did
+all day: writes `on` to the reader's power/control (which resumes it), waits for the device that the kernel
+detects again to be bound and active (0.5 s, then up to 5 s in 0.2 s steps, looking the device up afresh
+each time), writes `on` to that one too so that it cannot power down before the system is asleep, and at
+`post` writes `auto`. A reader that is not on the bus, or already active, costs the hook nothing. install.sh
+configs removes an installed copy of the rule (and the initramfs it rebuilds no longer carries one, which
+matters: udev in the initramfs would pin the reader on at every boot) and sets a reader on the bus back to
+`auto`. README and report.sh follow.
+Tested against a fake device tree (the hook's device directory can be redirected): active reader pinned in
+30 ms, `post` back to auto, a powered-down reader that becomes active 1.3 s later handled in 1.4 s, one that
+never comes back given up on after 6 s with exit 0, no reader and other arguments are no-ops. Not yet run by
+systemd-sleep: the real sequence, the hook's 1.2 s and what the sleep after it looks like, are still to be
+seen.
+Lesson: a fix that holds a device in one power state has to be measured in the other state before it is
+called done, and "probably milliwatts" is a guess until the meter says so; the user's "let's find out" was
+the right instinct and mine was not.

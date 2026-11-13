@@ -7,6 +7,7 @@ NAME=surface-laptop-7-intel; VER=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$D
 command -v dkms >/dev/null && dkms remove -m $NAME -v $VER --all 2>/dev/null; rm -rf /usr/src/$NAME-$VER /etc/depmod.d/surface-laptop-7-intel.conf /etc/systemd/system/dkms.service.d/surface-laptop-7-intel.conf /var/cache/surface-laptop-7-intel
 for k in /lib/modules/*/updates; do rm -f $k/surface_aggregator_registry.ko $k/ov02c10.ko $k/snd-soc-sdw-utils.ko $k/intel-ipu7-isys.ko; done; depmod -a "$K"
 (cd "$D/configs" && find . -type f | while read -r f; do rm -f "/${f#./}"; done)
+rm -f /etc/udev/rules.d/90-surface-sl7-card-reader.rules   # shipped 2026-11-12 to 13, replaced by the sleep hook sl7-card-reader.sh
 command -v dracut >/dev/null && dracut --regenerate-all --force   # the modules-load/modprobe/dracut files were in the initramfs too
 systemctl disable iptsd-resume.service surface-laptop-7-intel-dkms.service 2>/dev/null; rmdir /etc/systemd/system/dkms.service.d 2>/dev/null; systemctl daemon-reload; udevadm control --reload
 command -v grubby >/dev/null && grubby --update-kernel=ALL --remove-args="acpi_mask_gpe=0xAB"
