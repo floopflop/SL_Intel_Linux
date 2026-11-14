@@ -207,7 +207,9 @@ rebuilt the modules and the version lock kept libcamera).
   (table above): `journalctl -kb | grep -B3 'suspend devices took'` then shows `pcieport
   0000:00:1c.4: retraining failed` before a device suspend of about 3 s. The sleep hook
   `sl7-card-reader.sh` wakes the reader first, so that it is active when the suspend starts and
-  goes down cleanly; `sudo ./install.sh configs` installs it. With the reader active at suspend the
+  goes down cleanly; `sudo ./install.sh configs` installs it. Waking the reader delays the suspend
+  by about 3 s, and by about 9 s when the reader is slow to come back (two suspends in seven
+  here). With the reader active at suspend the
   share of deep idle went from 0 to over 99% of a sleep. Do not simply keep the reader awake
   (`power/control` set to `on`): that fixes sleep as well, but an idle laptop then draws 2.85 W
   where it drew 1.8 W, because the processor cannot idle deeply while awake either. The 13.8-inch

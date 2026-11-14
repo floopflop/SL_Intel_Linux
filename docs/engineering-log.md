@@ -1060,3 +1060,27 @@ seen.
 Lesson: a fix that holds a device in one power state has to be measured in the other state before it is
 called done, and "probably milliwatts" is a guess until the meter says so; the user's "let's find out" was
 the right instinct and mine was not.
+The hook's first evening, 2026-11-13, installed at 16:40 with `install.sh configs` (which also removed the
+rule and its copy in the initramfs). Seven suspends by 19:32, all clean: 0.45 to 0.55 s in device suspend,
+the retraining failure and the new detection always before `PM: suspend entry`, 2.60 of 2.62 h asleep in
+S0ix (99.2%). After each resume the reader was back in D3cold with power/control=auto within half a minute,
+so the watt it cost awake is gone.
+The price is time before the machine sleeps. The hook's write makes the kernel try to resume the reader,
+wait about 1.1 s for its link, give up and remove it (`retraining failed`, `Card not present`). In five
+suspends `Card present` followed 0.02 s later and the suspend started 4.3 s after logind's request; in two
+(16:42:30 and 19:00:12) it followed 6.68 and 6.72 s later and the suspend started after 10.7 and 9.6 s.
+Before the hook a lid close reached `suspend entry` in about 1.3 s. The kernel's messages of slow and fast
+suspends are identical up to the removal, and how long the reader had been down does not tell them apart
+(2 min and 13 s for the slow ones, 52 s to 4.5 min for the fast ones). My reading, not traced: pciehp looks
+for presence and link right after handling the removal; usually the reader's link is up by then, having
+needed just over the second the kernel allows, and sometimes it comes up seven seconds later, which is the
+reader's own link start-up. Not pursued, by the user's decision: tracing the hotplug and runtime PM events,
+and a report upstream about the link not retraining when this reader resumes from D3cold, which is the
+defect that makes the hook necessary at all.
+One change from it: the hook's wait had been 0.5 s plus 25 polls, each of which searched the whole bus for
+the reader, about 7 s in practice, and it had caught both slow detections with half a second to spare. It
+now polls the reader's own path (the new device has the same address) for up to 12 s. Tested against a fake
+device tree in which the reader disappears just after the hook has found it: back after 0.02 s, the hook
+returns in 0.5 s; back after 6.7 s, in 7.0 s; never back, it gives up after 12.7 s with exit 0. My first run
+of that test removed the fake reader before the hook started and so tested nothing; the hook exited at
+once, correctly, having found no reader.

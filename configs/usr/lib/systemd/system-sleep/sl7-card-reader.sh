@@ -10,10 +10,9 @@
 # suspend), and the package then stays in C2 for the whole sleep: no S0ix, about 1.5 W, a third of
 # the battery in a night. A reader that is active when the suspend starts goes down cleanly.
 #
-# So "pre" resumes the reader and holds it active. Resuming takes about 1.2 s: the link fails to
-# retrain here too, and the kernel removes the reader and detects it again, which is why the code
-# looks the device up afresh instead of keeping its path. "post" returns it to "auto"; the reader
-# that the kernel detects at resume starts out that way in any case.
+# So "pre" resumes the reader and holds it active. Resuming takes a second or more: the link fails
+# to retrain here too, and the kernel removes the reader and detects it again. "post" returns it to
+# "auto"; the reader that the kernel detects at resume starts out that way in any case.
 DEVS=${SL7_PCI_DEVICES:-/sys/bus/pci/devices}
 
 reader() {   # the reader's sysfs directory, if it is on the bus
@@ -29,10 +28,13 @@ case "$1" in
     d=$(reader) || exit 0                        # not on the bus: nothing to resume, the suspend is clean
     if ! active "$d"; then
       echo on > "$d/power/control" 2>/dev/null   # returns once the resume has been tried
-      sleep 0.5                                  # the kernel now removes the reader and detects it again
-      i=0; until { d=$(reader) && active "$d"; } || [ $i -ge 25 ]; do sleep 0.2; i=$((i + 1)); done
+      # The kernel now removes the reader and detects it again at the same address: 20 ms later in
+      # five suspends out of seven, 6.7 s later in the other two. Wait for the new device to be
+      # bound and active, for up to 12 s, so that the suspend does not start while it is missing.
+      sleep 0.5
+      i=0; until active "$d" || [ $i -ge 60 ]; do sleep 0.2; i=$((i + 1)); done
     fi
-    d=$(reader) && echo on > "$d/power/control" 2>/dev/null   # keep it active until the system is down
+    [ -e "$d/power/control" ] && echo on > "$d/power/control" 2>/dev/null   # keep it active until the system is down
     ;;
   post)
     d=$(reader) && echo auto > "$d/power/control" 2>/dev/null
